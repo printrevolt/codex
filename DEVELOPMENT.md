@@ -45,6 +45,21 @@ powershell -ExecutionPolicy Bypass -File scripts/dev/bootstrap.ps1
 
 Bootstrap is non-destructive: it installs missing dev tools where possible and prints instructions when it cannot.
 
+If you used bootstrap and don’t already have Rust on PATH, enable the toolchain in your current shell:
+
+```bash
+export RUSTUP_HOME="$PWD/.printrevolt-dev/rustup"
+export CARGO_HOME="$PWD/.printrevolt-dev/cargo"
+export PATH="$CARGO_HOME/bin:$PATH"
+```
+
+## Local install + smoke test
+
+See `PRINTREVOLT_LOCAL_MACHINE.md` for:
+- build/install options (`cargo build` vs `cargo install`)
+- a manual test checklist for PrintRevolt’s tool interception + finalize gating + audit
+- rollback steps to upstream Codex CLI via `npx`
+
 ## Build / test (local)
 
 From `codex-rs/`:

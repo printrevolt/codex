@@ -4,6 +4,8 @@ This document describes the PrintRevolt extensions implemented in this fork of C
 
 The design source of truth is maintained in PrintRevolt’s internal docs; this file is a user-facing overview with copy/paste examples.
 
+For general Codex CLI usage (slash commands, config, exec mode), see the upstream docs in `docs/` at the repo root (for example `docs/getting-started.md`, `docs/slash_commands.md`, and `docs/config.md`).
+
 ## Install / Entry Points
 
 - `codex` (agent CLI, upstream behavior plus PrintRevolt interception hooks)
@@ -38,6 +40,10 @@ enabled = true
 trusted_repo_roots = ["/abs/path/to/repo"]
 ```
 
+Notes:
+- `command_prefixes` matches **argv prefixes** for the `shell` tool (for example `["npm","test"]`).
+- If verification runs via the `shell_command` tool (single string command), use single-element prefixes such as `["npm test"]`.
+
 ## Policy + Hooks (tool boundary)
 
 All tool calls are intercepted:
@@ -46,6 +52,9 @@ All tool calls are intercepted:
 2. Policy revalidates after hook modifications (modify -> revalidate)
 
 Finalize gating can block the final response if verify evidence is required and missing/stale/failed.
+
+Current hook surface:
+- `before_tool` only (configured at `printrevolt.hooks.before_tool`)
 
 ## Pipelines (typed parts)
 

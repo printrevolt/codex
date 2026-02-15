@@ -63,5 +63,6 @@ If you’re working in the PrintRevolt fork/mirror, start with:
 - `PRINTREVOLT_UPSTREAM_MIRROR.md`
 - `codex-rs/docs/PRINTREVOLT.md`
 - `codex-rs/docs/EXTENSION_POINTS.md`
+- `PRINTREVOLT_LOCAL_MACHINE.md`
 
 This repository is licensed under the [Apache-2.0 License](LICENSE).
