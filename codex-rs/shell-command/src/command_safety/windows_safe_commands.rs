@@ -127,17 +127,39 @@ fn is_powershell_executable(exe: &str) -> bool {
 fn parse_with_powershell_ast(executable: &str, script: &str) -> PowershellParseOutcome {
     let encoded_script = encode_powershell_base64(script);
     let encoded_parser_script = encoded_parser_script();
-    match Command::new(executable)
-        .args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-EncodedCommand",
-            encoded_parser_script,
-        ])
-        .env("CODEX_POWERSHELL_PAYLOAD", &encoded_script)
-        .output()
-    {
+    let mut command = Command::new(executable);
+    command.args([
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-EncodedCommand",
+        encoded_parser_script,
+    ]);
+    command.env("CODEX_POWERSHELL_PAYLOAD", &encoded_script);
+
+    // When running a Windows PowerShell executable under WSL, environment variables are not
+    // forwarded to the Windows process unless they are explicitly listed in `WSLENV`.
+    //
+    // Without this, safe-command parsing falls back to "Failed" even for benign commands like
+    // `powershell.exe -Command "ls -Name"`, because the parser script cannot read
+    // `CODEX_POWERSHELL_PAYLOAD`.
+    if !cfg!(windows) {
+        let existing = std::env::var("WSLENV").unwrap_or_default();
+        let already_included = existing
+            .split(':')
+            .filter(|entry| !entry.is_empty())
+            .any(|entry| entry.split('/').next() == Some("CODEX_POWERSHELL_PAYLOAD"));
+        if !already_included {
+            let updated = if existing.is_empty() {
+                "CODEX_POWERSHELL_PAYLOAD".to_string()
+            } else {
+                format!("{existing}:CODEX_POWERSHELL_PAYLOAD")
+            };
+            command.env("WSLENV", updated);
+        }
+    }
+
+    match command.output() {
         Ok(output) if output.status.success() => {
             if let Ok(result) =
                 serde_json::from_slice::<PowershellParserOutput>(output.stdout.as_slice())
