@@ -17,6 +17,11 @@ use codex_hooks::HookPayload;
 use codex_hooks::HookToolInput;
 use codex_hooks::HookToolInputLocalShell;
 use codex_hooks::HookToolKind;
+use codex_pr_types::DecisionKind;
+use codex_pr_types::ToolCall;
+use codex_pr_types::ToolInput as PrToolInput;
+use codex_pr_types::ToolKind as PrToolKind;
+use codex_pr_types::ToolOutcome;
 use codex_protocol::models::ResponseInputItem;
 use codex_utils_readiness::Readiness;
 use tracing::warn;
@@ -75,7 +80,7 @@ impl ToolRegistry {
 
     pub async fn dispatch(
         &self,
-        invocation: ToolInvocation,
+        mut invocation: ToolInvocation,
     ) -> Result<ResponseInputItem, FunctionCallError> {
         let tool_name = invocation.tool_name.clone();
         let call_id_owned = invocation.call_id.clone();
@@ -129,6 +134,67 @@ impl ToolRegistry {
         }
 
         let is_mutating = handler.is_mutating(&invocation).await;
+        let turn_id = invocation.turn.sub_id.clone();
+        let mut pr_call = to_pr_tool_call(&invocation);
+        let pr_decision = invocation
+            .session
+            .services
+            .pr_runtime
+            .before_tool_call(
+                invocation.session.conversation_id,
+                turn_id.as_str(),
+                invocation.turn.cwd.as_path(),
+                pr_call.clone(),
+            )
+            .await;
+        match pr_decision.kind {
+            DecisionKind::Allow => {}
+            DecisionKind::Block => {
+                let reason = pr_decision
+                    .reason_code
+                    .clone()
+                    .unwrap_or_else(|| "PrBlocked".to_string());
+                let msg = pr_decision
+                    .message
+                    .clone()
+                    .unwrap_or_else(|| "Blocked by PrintRevolt policy.".to_string());
+                let message = format!("[{reason}] {msg}");
+                invocation
+                    .session
+                    .services
+                    .pr_runtime
+                    .after_tool_call(
+                        invocation.session.conversation_id,
+                        turn_id.as_str(),
+                        invocation.turn.cwd.as_path(),
+                        pr_call,
+                        ToolOutcome {
+                            executed: false,
+                            success: false,
+                            duration_ms: 0,
+                            output_preview: message.clone(),
+                        },
+                    )
+                    .await;
+                dispatch_after_tool_use_hook(AfterToolUseHookDispatch {
+                    invocation: &invocation,
+                    output_preview: message.clone(),
+                    success: false,
+                    executed: false,
+                    duration: Duration::ZERO,
+                    mutating: is_mutating,
+                })
+                .await;
+                return Err(FunctionCallError::RespondToModel(message));
+            }
+            DecisionKind::Modify => {
+                if let Some(modified_call) = pr_decision.modified_call.clone() {
+                    apply_pr_modification(&mut pr_call, &modified_call);
+                    apply_pr_modification_to_invocation(&mut invocation, &modified_call);
+                }
+            }
+        }
+
         let output_cell = tokio::sync::Mutex::new(None);
         let invocation_for_tool = invocation.clone();
 
@@ -167,6 +233,23 @@ impl ToolRegistry {
             Ok((preview, success)) => (preview.clone(), *success),
             Err(err) => (err.to_string(), false),
         };
+        invocation
+            .session
+            .services
+            .pr_runtime
+            .after_tool_call(
+                invocation.session.conversation_id,
+                turn_id.as_str(),
+                invocation.turn.cwd.as_path(),
+                pr_call,
+                ToolOutcome {
+                    executed: true,
+                    success,
+                    duration_ms: duration.as_millis().try_into().unwrap_or(u64::MAX),
+                    output_preview: output_preview.clone(),
+                },
+            )
+            .await;
         dispatch_after_tool_use_hook(AfterToolUseHookDispatch {
             invocation: &invocation,
             output_preview,
@@ -187,6 +270,78 @@ impl ToolRegistry {
             }
             Err(err) => Err(err),
         }
+    }
+}
+
+fn to_pr_tool_call(invocation: &ToolInvocation) -> ToolCall {
+    match &invocation.payload {
+        ToolPayload::Function { arguments } => ToolCall {
+            call_id: invocation.call_id.clone(),
+            tool_name: invocation.tool_name.clone(),
+            tool_kind: PrToolKind::Function,
+            input: PrToolInput::Function {
+                arguments: arguments.clone(),
+            },
+        },
+        ToolPayload::Custom { input } => ToolCall {
+            call_id: invocation.call_id.clone(),
+            tool_name: invocation.tool_name.clone(),
+            tool_kind: PrToolKind::Custom,
+            input: PrToolInput::Custom {
+                input: input.clone(),
+            },
+        },
+        ToolPayload::LocalShell { params } => ToolCall {
+            call_id: invocation.call_id.clone(),
+            tool_name: invocation.tool_name.clone(),
+            tool_kind: PrToolKind::LocalShell,
+            input: PrToolInput::LocalShell {
+                command: params.command.clone(),
+                workdir: params.workdir.clone(),
+            },
+        },
+        ToolPayload::Mcp {
+            server,
+            tool,
+            raw_arguments,
+        } => ToolCall {
+            call_id: invocation.call_id.clone(),
+            tool_name: invocation.tool_name.clone(),
+            tool_kind: PrToolKind::Mcp,
+            input: PrToolInput::Mcp {
+                server: server.clone(),
+                tool: tool.clone(),
+                arguments: raw_arguments.clone(),
+            },
+        },
+    }
+}
+
+fn apply_pr_modification(original: &mut ToolCall, modified: &ToolCall) {
+    // Keep call_id/tool_name stable; only adopt input changes when compatible.
+    if original.tool_kind != modified.tool_kind || original.tool_name != modified.tool_name {
+        return;
+    }
+    original.input = modified.input.clone();
+}
+
+fn apply_pr_modification_to_invocation(invocation: &mut ToolInvocation, modified: &ToolCall) {
+    if modified.tool_name != invocation.tool_name {
+        return;
+    }
+    match (&invocation.payload, &modified.input) {
+        (ToolPayload::Function { .. }, PrToolInput::Function { arguments }) => {
+            invocation.payload = ToolPayload::Function {
+                arguments: arguments.clone(),
+            };
+        }
+        (ToolPayload::LocalShell { params }, PrToolInput::LocalShell { command, workdir }) => {
+            let mut updated = params.clone();
+            updated.command = command.clone();
+            updated.workdir = workdir.clone();
+            invocation.payload = ToolPayload::LocalShell { params: updated };
+        }
+        _ => {}
     }
 }
 

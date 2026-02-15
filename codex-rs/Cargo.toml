@@ -61,6 +61,19 @@ members = [
     "codex-api",
     "state",
     "codex-experimental-api-macros",
+    "crates/pr_runtime",
+    "crates/pr_integration_tests",
+    "crates/pr_config",
+    "crates/pr_cli",
+    "crates/pr_types",
+    "crates/pr_audit",
+    "crates/pr_policy",
+    "crates/pr_hooks",
+    "crates/pr_pipelines",
+    "crates/pr_repo_ops",
+    "crates/pr_templates",
+    "crates/pr_updater",
+    "crates/pr_advisor",
 ]
 resolver = "2"
 

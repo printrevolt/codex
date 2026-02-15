@@ -1,0 +1,23 @@
+[package]
+name = "codex-pr-hooks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "codex_pr_hooks"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+codex-pr-types = { path = "../pr_types" }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["process", "time", "io-util"] }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+

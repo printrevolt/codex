@@ -218,6 +218,24 @@ impl Session {
             self.record_conversation_items(turn_context.as_ref(), &pending_response_items)
                 .await;
         }
+        self.services
+            .pr_runtime
+            .before_finalize(
+                self.conversation_id,
+                turn_context.sub_id.as_str(),
+                turn_context.cwd.as_path(),
+            )
+            .await;
+        let gated = self
+            .services
+            .pr_runtime
+            .finalize_gate(
+                self.conversation_id,
+                turn_context.sub_id.as_str(),
+                turn_context.cwd.as_path(),
+            )
+            .await;
+        let last_agent_message = gated.or(last_agent_message);
         let event = EventMsg::TurnComplete(TurnCompleteEvent {
             turn_id: turn_context.sub_id.clone(),
             last_agent_message,

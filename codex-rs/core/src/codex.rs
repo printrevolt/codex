@@ -48,6 +48,7 @@ use codex_hooks::HookPayload;
 use codex_hooks::Hooks;
 use codex_hooks::HooksConfig;
 use codex_network_proxy::NetworkProxy;
+use codex_pr_runtime::PrRuntime;
 use codex_protocol::ThreadId;
 use codex_protocol::approvals::ExecPolicyAmendment;
 use codex_protocol::config_types::ModeKind;
@@ -1177,6 +1178,7 @@ impl Session {
             hooks: Hooks::new(HooksConfig {
                 legacy_notify_argv: config.notify.clone(),
             }),
+            pr_runtime: PrRuntime::default(),
             rollout: Mutex::new(rollout_recorder),
             user_shell: Arc::new(default_shell),
             shell_snapshot_tx,
@@ -1269,6 +1271,15 @@ impl Session {
 
         // Start the watcher after SessionConfigured so it cannot emit earlier events.
         sess.start_file_watcher_listener();
+
+        sess.services
+            .pr_runtime
+            .on_session_start(
+                sess.conversation_id,
+                session_configuration.codex_home.as_path(),
+                session_configuration.cwd.as_path(),
+            )
+            .await;
 
         // Construct sandbox_state before initialize() so it can be sent to each
         // MCP server immediately after it becomes ready (avoiding blocking).
@@ -3234,6 +3245,14 @@ mod handlers {
             sess.refresh_mcp_servers_if_requested(&current_context)
                 .await;
             let regular_task = sess.take_startup_regular_task().await.unwrap_or_default();
+            sess.services
+                .pr_runtime
+                .before_task(
+                    sess.conversation_id,
+                    current_context.sub_id.as_str(),
+                    current_context.cwd.as_path(),
+                )
+                .await;
             sess.spawn_task(Arc::clone(&current_context), items, regular_task)
                 .await;
             *previous_context = Some(current_context);
@@ -3766,6 +3785,14 @@ mod handlers {
         sess.services
             .unified_exec_manager
             .terminate_all_processes()
+            .await;
+        let cwd = {
+            let state = sess.state.lock().await;
+            state.session_configuration.cwd.clone()
+        };
+        sess.services
+            .pr_runtime
+            .on_session_end(sess.conversation_id, cwd.as_path())
             .await;
         info!("Shutting down Codex instance");
         let history = sess.clone_history().await;
@@ -6634,6 +6661,7 @@ mod tests {
             hooks: Hooks::new(HooksConfig {
                 legacy_notify_argv: config.notify.clone(),
             }),
+            pr_runtime: PrRuntime::default(),
             rollout: Mutex::new(None),
             user_shell: Arc::new(default_user_shell()),
             shell_snapshot_tx: watch::channel(None).0,
@@ -6779,6 +6807,7 @@ mod tests {
             hooks: Hooks::new(HooksConfig {
                 legacy_notify_argv: config.notify.clone(),
             }),
+            pr_runtime: PrRuntime::default(),
             rollout: Mutex::new(None),
             user_shell: Arc::new(default_user_shell()),
             shell_snapshot_tx: watch::channel(None).0,

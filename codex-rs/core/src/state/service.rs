@@ -16,6 +16,7 @@ use crate::tools::sandboxing::ApprovalStore;
 use crate::unified_exec::UnifiedExecProcessManager;
 use codex_hooks::Hooks;
 use codex_otel::OtelManager;
+use codex_pr_runtime::PrRuntime;
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 use tokio::sync::watch;
@@ -27,6 +28,7 @@ pub(crate) struct SessionServices {
     pub(crate) unified_exec_manager: UnifiedExecProcessManager,
     pub(crate) analytics_events_client: AnalyticsEventsClient,
     pub(crate) hooks: Hooks,
+    pub(crate) pr_runtime: PrRuntime,
     pub(crate) rollout: Mutex<Option<RolloutRecorder>>,
     pub(crate) user_shell: Arc<crate::shell::Shell>,
     pub(crate) shell_snapshot_tx: watch::Sender<Option<Arc<crate::shell_snapshot::ShellSnapshot>>>,

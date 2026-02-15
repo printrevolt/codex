@@ -1,0 +1,30 @@
+[package]
+name = "codex-pr-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "codex_pr_runtime"
+path = "src/lib.rs"
+
+[features]
+probe = []
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+chrono = { workspace = true }
+codex-protocol = { workspace = true }
+codex-pr-audit = { path = "../pr_audit" }
+codex-pr-config = { path = "../pr_config" }
+codex-pr-hooks = { path = "../pr_hooks" }
+codex-pr-policy = { path = "../pr_policy" }
+codex-pr-templates = { path = "../pr_templates" }
+codex-pr-types = { path = "../pr_types" }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+toml = { workspace = true }
+tracing = { workspace = true }
