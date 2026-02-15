@@ -68,6 +68,9 @@ coverage/
 # personal files
 personal/
 
+# printrevolt local dev tool installs
+.printrevolt-dev/
+
 # os
 .DS_Store
 Thumbs.db
@@ -90,4 +93,3 @@ CHANGELOG.ignore.md
 # Python bytecode files
 __pycache__/
 *.pyc
-

@@ -56,4 +56,12 @@ You can also use Codex with an API key, but this requires [additional setup](htt
 - [**Installing & building**](./docs/install.md)
 - [**Open source fund**](./docs/open-source-fund.md)
 
+## PrintRevolt fork development
+
+If you’re working in the PrintRevolt fork/mirror, start with:
+- `DEVELOPMENT.md`
+- `PRINTREVOLT_UPSTREAM_MIRROR.md`
+- `codex-rs/docs/PRINTREVOLT.md`
+- `codex-rs/docs/EXTENSION_POINTS.md`
+
 This repository is licensed under the [Apache-2.0 License](LICENSE).

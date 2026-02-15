@@ -1,0 +1,9 @@
+{
+  "npm_package": "@openai/codex",
+  "npm_version": "0.101.0",
+  "upstream_repo": "openai/codex",
+  "upstream_tag": "rust-v0.101.0",
+  "upstream_commit": "cf5f1868bc3df74739fc8e06e5c2e93728c5d8f9",
+  "recorded_at_utc": "2026-02-14T00:00:00Z"
+}
+

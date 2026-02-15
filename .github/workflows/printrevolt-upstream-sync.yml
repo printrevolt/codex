@@ -1,0 +1,71 @@
+name: printrevolt-upstream-sync
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "0 12 * * 1" # Mondays 12:00 UTC
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Sync to upstream tag matching npm @latest
+        run: |
+          bash scripts/printrevolt_upstream_sync.sh
+
+      - name: Enforce diff budget
+        run: |
+          bash scripts/printrevolt_diff_budget.sh
+
+      - name: Install system deps for Rust builds
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev libcap-dev
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            codex-rs -> target
+
+      - name: Run test suite (targeted)
+        run: |
+          cd codex-rs
+          cargo test -p codex-pr-integration-tests -p codex-pr-cli
+
+      - name: Push sync branch
+        run: |
+          git push --force-with-lease origin "${SYNC_BRANCH}"
+
+      - name: Create PR (if missing)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pr_number="$(gh pr list --head "${SYNC_BRANCH}" --json number -q '.[0].number' || true)"
+          if [[ -n "${pr_number}" ]]; then
+            echo "PR already exists: #${pr_number}"
+            exit 0
+          fi
+          gh pr create \
+            --base "main" \
+            --head "${SYNC_BRANCH}" \
+            --title "Upstream sync: ${UPSTREAM_TAG} (npm ${NPM_VERSION})" \
+            --body "Automated upstream sync PR. Includes diff-budget guard + targeted Rust tests."
