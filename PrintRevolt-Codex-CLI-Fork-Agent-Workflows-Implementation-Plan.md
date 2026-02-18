@@ -471,11 +471,11 @@ Priority values:
 
 | ID | Task | Priority | Status | Depends on | Notes |
 | --- | --- | --- | --- | --- | --- |
-| WF-00 | Lock schema approach: new `workflows.json` vs extend `pipelines.json` | P0 | Planned | - | This plan assumes new `workflows.json` schema "1". |
-| WF-01 | Define `workflows.json` schema "1" (types, validation rules) | P0 | Planned | WF-00 | Include `enabled=false` default for starter drafts. |
-| WF-02 | Add config gate `[printrevolt.workflows]` (enabled + bounds) | P0 | Planned | WF-01 | Must default `enabled=false`. |
-| WF-03 | Add trust gating + scope merge for workflows (global/project/both) | P0 | Planned | WF-01 | Mirror pipelines/templates trust behavior. |
-| WF-04 | Add backups for `workflows.json` writes | P1 | Planned | WF-03 | Store under `CODEX_HOME/printrevolt/backups/workflows`. |
+| WF-00 | Lock schema approach: new `workflows.json` vs extend `pipelines.json` | P0 | Done | - | Locked to new `workflows.json` schema "1". |
+| WF-01 | Define `workflows.json` schema "1" (types, validation rules) | P0 | Done | WF-00 | Implemented in `codex-pr-types` (`WorkflowsFileV1` + validation). |
+| WF-02 | Add config gate `[printrevolt.workflows]` (enabled + bounds) | P0 | Done | WF-01 | Added defaults in `pr_types`, `pr_config`, and installer init config. |
+| WF-03 | Add trust gating + scope merge for workflows (global/project/both) | P0 | Done | WF-01 | Implemented in `codex-pr workflows list/show` with warnings. |
+| WF-04 | Add backups for `workflows.json` writes | P1 | Done | WF-03 | Added write backups + restore flow and backups target support. |
 | WF-05 | Create crate `codex_pr_workflows` (engine skeleton + schema IO) | P0 | Planned | WF-01 | Keep the engine pure and testable. |
 | WF-06 | Artifact store (content-addressed files + metadata + size limits) | P0 | Planned | WF-05, WF-02 | Default root under `CODEX_HOME/printrevolt/artifacts/workflows/`. |
 | WF-07 | Workflow engine control flow (steps + transitions + bounded revision loop) | P0 | Planned | WF-06 | Implement `generate_artifact`, `review_artifact`, `revise_artifact`, `complete`. |

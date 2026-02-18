@@ -314,6 +314,16 @@ fn default_printrevolt_table() -> TomlValue {
     pipelines.insert("enabled".to_string(), TomlValue::Boolean(false));
     root.insert("pipelines".to_string(), TomlValue::Table(pipelines));
 
+    let mut workflows = toml::map::Map::new();
+    workflows.insert("enabled".to_string(), TomlValue::Boolean(false));
+    workflows.insert("max_revisions".to_string(), TomlValue::Integer(3));
+    workflows.insert(
+        "max_artifact_bytes".to_string(),
+        TomlValue::Integer(262_144),
+    );
+    workflows.insert("max_feedback_bytes".to_string(), TomlValue::Integer(8_192));
+    root.insert("workflows".to_string(), TomlValue::Table(workflows));
+
     let mut templates = toml::map::Map::new();
     templates.insert(
         "selection_mode".to_string(),

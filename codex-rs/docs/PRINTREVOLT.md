@@ -84,6 +84,28 @@ Teardown:
 - `defer` registers LIFO cleanup actions
 - destructive cleanup should be user-controlled via `require_approval(mode="confirm")` default deny
 
+## Workflows (phase orchestration bundles)
+
+Workflows are stored as JSON bundles and managed by `codex-pr workflows`:
+
+- Global: `<CODEX_HOME>/printrevolt/workflows.json`
+- Repo (trusted only): `<repo_root>/.codex/printrevolt/workflows.json`
+
+Current headless CLI surface:
+
+```bash
+codex-pr workflows list --scope both --json
+codex-pr workflows show --scope both --id product_flow --json
+codex-pr workflows draft --scope global
+codex-pr workflows draft --scope global --apply
+codex-pr workflows enable  --scope global
+codex-pr workflows disable --scope global
+```
+
+Safe defaults:
+- `printrevolt.workflows.enabled=false` by default
+- starter workflow drafts are created with `enabled=false`
+
 ## Command Catalogs (`commands.json`)
 
 Use `command_id` indirection instead of repeating argv in pipelines:

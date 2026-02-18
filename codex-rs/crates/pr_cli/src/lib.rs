@@ -19,6 +19,10 @@ use codex_pr_pipelines::expand_pipeline;
 use codex_pr_repo_ops::BranchEnsureArgs;
 use codex_pr_repo_ops::RepoOpPlan;
 use codex_pr_repo_ops::WorktreeEnsureArgs;
+use codex_pr_types::WorkflowEntryV1;
+use codex_pr_types::WorkflowGraphV1;
+use codex_pr_types::WorkflowStepV1;
+use codex_pr_types::WorkflowsFileV1;
 use codex_pr_updater::UpdateChannel;
 use codex_pr_updater::UpdateCheckRequest;
 use codex_utils_home_dir::find_codex_home;
@@ -106,6 +110,12 @@ enum Command {
     Pipelines {
         #[command(subcommand)]
         command: PipelinesCommand,
+    },
+
+    /// Workflow discovery and generation helpers.
+    Workflows {
+        #[command(subcommand)]
+        command: WorkflowsCommand,
     },
 
     /// Backup inventory and restore helpers.
@@ -451,6 +461,103 @@ enum PipelinesCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum WorkflowsCommand {
+    /// List workflows from global/project workflow bundles.
+    List {
+        /// Override project root (defaults to searching upward from cwd for .git).
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+
+        /// Workflow bundle scope.
+        #[arg(long, value_enum, default_value = "both")]
+        scope: Scope,
+
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Show a workflow entry by id from global/project workflow bundles.
+    Show {
+        /// Override project root (defaults to searching upward from cwd for .git).
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+
+        /// Workflow bundle scope.
+        #[arg(long, value_enum, default_value = "both")]
+        scope: Scope,
+
+        /// Workflow id.
+        #[arg(long)]
+        id: String,
+
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Enable workflow functionality.
+    Enable {
+        /// Override project root (defaults to searching upward from cwd for .git).
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+
+        /// Config write scope.
+        #[arg(long, value_enum, default_value = "global")]
+        scope: Scope,
+    },
+
+    /// Disable workflow functionality.
+    Disable {
+        /// Override project root (defaults to searching upward from cwd for .git).
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+
+        /// Config write scope.
+        #[arg(long, value_enum, default_value = "global")]
+        scope: Scope,
+    },
+
+    /// Generate a starter product workflow (preview-only unless --apply is set).
+    Draft {
+        /// Override project root (defaults to searching upward from cwd for .git).
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+
+        /// Write scope for workflows bundle updates.
+        #[arg(long, value_enum, default_value = "global")]
+        scope: Scope,
+
+        /// Workflow id to create (default: product_flow).
+        #[arg(long, default_value = "product_flow")]
+        id: String,
+
+        /// Workflow name (default: Product Workflow).
+        #[arg(long, default_value = "Product Workflow")]
+        name: String,
+
+        /// Apply by writing to the selected workflows.json (with backup).
+        #[arg(long)]
+        apply: bool,
+    },
+
+    /// Restore workflows.json from a backup snapshot.
+    Restore {
+        /// Override project root (defaults to searching upward from cwd for .git).
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+
+        /// Restore scope target.
+        #[arg(long, value_enum, default_value = "global")]
+        scope: Scope,
+
+        /// Backup file path (from `codex-pr backups list --kind workflows`).
+        #[arg(long)]
+        backup_path: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum BackupsCommand {
     /// List backups under CODEX_HOME/printrevolt/backups.
     List {
@@ -465,7 +572,7 @@ enum BackupsCommand {
 
     /// Restore a PrintRevolt-owned file from a backup snapshot (best-effort).
     Restore {
-        /// Restore target (printrevolt-toml or pipelines-json).
+        /// Restore target (printrevolt-toml or pipelines-json or workflows-json).
         #[arg(long)]
         target: String,
 
@@ -625,6 +732,15 @@ struct PipelineResolvedEntryV1 {
     pipeline: Pipeline,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+struct WorkflowResolvedEntryV1 {
+    id: String,
+    name: String,
+    enabled: bool,
+    source: LayerScope,
+    workflow: WorkflowGraphV1,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -638,6 +754,17 @@ fn project_pipelines_json_path(project_root: &Path) -> PathBuf {
         .join(".codex")
         .join("printrevolt")
         .join("pipelines.json")
+}
+
+fn global_workflows_json_path(codex_home: &Path) -> PathBuf {
+    codex_home.join("printrevolt").join("workflows.json")
+}
+
+fn project_workflows_json_path(project_root: &Path) -> PathBuf {
+    project_root
+        .join(".codex")
+        .join("printrevolt")
+        .join("workflows.json")
 }
 
 fn scoped_pipelines_json_path(
@@ -654,6 +781,24 @@ fn scoped_pipelines_json_path(
                 );
             };
             Ok(project_pipelines_json_path(project_root))
+        }
+    }
+}
+
+fn scoped_workflows_json_path(
+    codex_home: &Path,
+    project_root: Option<&Path>,
+    scope: LayerScope,
+) -> Result<PathBuf> {
+    match scope {
+        LayerScope::Global => Ok(global_workflows_json_path(codex_home)),
+        LayerScope::Project => {
+            let Some(project_root) = project_root else {
+                anyhow::bail!(
+                    "project scope selected but no project root detected; pass --project-root"
+                );
+            };
+            Ok(project_workflows_json_path(project_root))
         }
     }
 }
@@ -785,6 +930,97 @@ impl PipelinesFile {
             },
         }
     }
+}
+
+fn read_workflows_file_from_path(path: &Path) -> Result<WorkflowsFileV1> {
+    if !path.exists() {
+        return Ok(WorkflowsFileV1::default());
+    }
+    let raw = std::fs::read_to_string(path)?;
+    let file = serde_json::from_str::<WorkflowsFileV1>(&raw)?;
+    file.validate()
+        .map_err(|err| anyhow::anyhow!("invalid workflows.json ({}): {err}", path.display()))?;
+    Ok(file)
+}
+
+fn write_workflows_file(
+    codex_home: &Path,
+    path: &Path,
+    file: &WorkflowsFileV1,
+) -> Result<Option<PathBuf>> {
+    let backup = backup_file_if_present(path, codex_home, "workflows");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let encoded = serde_json::to_string_pretty(file)?;
+    std::fs::write(path, encoded)?;
+    Ok(backup)
+}
+
+fn merged_workflows(
+    codex_home: &Path,
+    project_root: Option<&Path>,
+    scope: Scope,
+) -> Result<MergedWorkflows> {
+    let mut out = BTreeMap::new();
+    let mut warnings = Vec::<String>::new();
+
+    if matches!(scope, Scope::Global | Scope::Both) {
+        let global_path = scoped_workflows_json_path(codex_home, project_root, LayerScope::Global)?;
+        let global = read_workflows_file_from_path(global_path.as_path())?;
+        for (id, entry) in global.workflows {
+            out.insert(
+                id,
+                WorkflowResolvedEntryV1 {
+                    id: entry.id,
+                    name: entry.name,
+                    enabled: entry.enabled,
+                    source: LayerScope::Global,
+                    workflow: entry.workflow,
+                },
+            );
+        }
+    }
+    if matches!(scope, Scope::Project | Scope::Both) {
+        if let Some(project_root) = project_root {
+            let trusted = repo_trusted(Some(project_root), codex_home);
+            if !trusted {
+                warnings.push(format!(
+                    "Repo workflows bundle ignored (repo not trusted): {}",
+                    project_root.display()
+                ));
+            } else {
+                let project_path = scoped_workflows_json_path(
+                    codex_home,
+                    Some(project_root),
+                    LayerScope::Project,
+                )?;
+                let project = read_workflows_file_from_path(project_path.as_path())?;
+                for (id, entry) in project.workflows {
+                    out.insert(
+                        id,
+                        WorkflowResolvedEntryV1 {
+                            id: entry.id,
+                            name: entry.name,
+                            enabled: entry.enabled,
+                            source: LayerScope::Project,
+                            workflow: entry.workflow,
+                        },
+                    );
+                }
+            }
+        }
+    }
+    Ok(MergedWorkflows {
+        entries: out,
+        warnings,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct MergedWorkflows {
+    entries: BTreeMap<String, WorkflowResolvedEntryV1>,
+    warnings: Vec<String>,
 }
 
 fn merged_pipelines(
@@ -1425,6 +1661,244 @@ pub fn run() -> Result<()> {
             }
         }
 
+        Command::Workflows { command } => {
+            let codex_home = find_codex_home()?;
+            match command {
+                WorkflowsCommand::List {
+                    project_root,
+                    scope,
+                    json,
+                } => {
+                    let project_root =
+                        require_project_root(discover_project_root(project_root), scope)?;
+                    let merged =
+                        merged_workflows(codex_home.as_path(), project_root.as_deref(), scope)?;
+                    let effective = merged.entries;
+                    if json {
+                        let global_path = global_workflows_json_path(codex_home.as_path());
+                        let project_path = project_root.as_deref().map(project_workflows_json_path);
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "scope": scope,
+                                "global_path": global_path,
+                                "project_path": project_path,
+                                "warnings": merged.warnings,
+                                "effective": effective.values().collect::<Vec<_>>(),
+                            }))?
+                        );
+                    } else if effective.is_empty() {
+                        println!("No workflows configured.");
+                    } else {
+                        for entry in effective.values() {
+                            println!(
+                                "{} ({}) enabled={} source={}",
+                                entry.name,
+                                entry.id,
+                                entry.enabled,
+                                entry.source.as_str()
+                            );
+                        }
+                        if !merged.warnings.is_empty() {
+                            println!();
+                            println!("Warnings:");
+                            for w in merged.warnings {
+                                println!("- {w}");
+                            }
+                        }
+                    }
+                }
+                WorkflowsCommand::Show {
+                    project_root,
+                    scope,
+                    id,
+                    json,
+                } => {
+                    let project_root =
+                        require_project_root(discover_project_root(project_root), scope)?;
+                    let merged =
+                        merged_workflows(codex_home.as_path(), project_root.as_deref(), scope)?;
+                    let effective = merged.entries;
+                    let entry = effective
+                        .get(&id)
+                        .ok_or_else(|| anyhow::anyhow!("workflow not found: {id}"))?;
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "entry": entry,
+                                "warnings": merged.warnings,
+                            }))?
+                        );
+                    } else {
+                        println!("{}", serde_json::to_string_pretty(entry)?);
+                        if !merged.warnings.is_empty() {
+                            println!();
+                            println!("Warnings:");
+                            for w in merged.warnings {
+                                println!("- {w}");
+                            }
+                        }
+                    }
+                }
+                WorkflowsCommand::Enable {
+                    project_root,
+                    scope,
+                } => {
+                    let project_root = discover_project_root(project_root);
+                    let writable_scope = ensure_writable_scope(scope, "--scope")?;
+                    let path = update_mode_b_config(
+                        codex_home.as_path(),
+                        project_root.as_deref(),
+                        writable_scope,
+                        |root| set_toml_bool(root, &["workflows", "enabled"], true),
+                    )?;
+                    println!("Enabled workflows in {}", path.display());
+                }
+                WorkflowsCommand::Disable {
+                    project_root,
+                    scope,
+                } => {
+                    let project_root = discover_project_root(project_root);
+                    let writable_scope = ensure_writable_scope(scope, "--scope")?;
+                    let path = update_mode_b_config(
+                        codex_home.as_path(),
+                        project_root.as_deref(),
+                        writable_scope,
+                        |root| set_toml_bool(root, &["workflows", "enabled"], false),
+                    )?;
+                    println!("Disabled workflows in {}", path.display());
+                }
+                WorkflowsCommand::Draft {
+                    project_root,
+                    scope,
+                    id,
+                    name,
+                    apply,
+                } => {
+                    let project_root = discover_project_root(project_root);
+                    let mut steps = BTreeMap::new();
+                    steps.insert(
+                        "generate_prd".to_string(),
+                        WorkflowStepV1::GenerateArtifact {
+                            template_id: "prd".to_string(),
+                            artifact_kind: "prd".to_string(),
+                            inputs: BTreeMap::new(),
+                            next_step: Some("review_prd".to_string()),
+                        },
+                    );
+                    steps.insert(
+                        "review_prd".to_string(),
+                        WorkflowStepV1::ReviewArtifact {
+                            artifact_ref: "prd".to_string(),
+                            prompt: "Review PRD and approve or provide feedback.".to_string(),
+                            on_approved: "generate_ux".to_string(),
+                            on_feedback: "revise_prd".to_string(),
+                            max_revisions: 3,
+                            revision_counter_key: "review_prd".to_string(),
+                        },
+                    );
+                    steps.insert(
+                        "revise_prd".to_string(),
+                        WorkflowStepV1::ReviseArtifact {
+                            template_id: "prd_revise".to_string(),
+                            artifact_ref: "prd".to_string(),
+                            feedback_key: "review_prd.feedback".to_string(),
+                            next_step: Some("review_prd".to_string()),
+                        },
+                    );
+                    steps.insert(
+                        "generate_ux".to_string(),
+                        WorkflowStepV1::GenerateArtifact {
+                            template_id: "ux_plan".to_string(),
+                            artifact_kind: "ux_plan".to_string(),
+                            inputs: BTreeMap::new(),
+                            next_step: Some("review_ux".to_string()),
+                        },
+                    );
+                    steps.insert(
+                        "review_ux".to_string(),
+                        WorkflowStepV1::ReviewArtifact {
+                            artifact_ref: "ux_plan".to_string(),
+                            prompt: "Review UX plan and approve or provide feedback.".to_string(),
+                            on_approved: "complete".to_string(),
+                            on_feedback: "revise_ux".to_string(),
+                            max_revisions: 3,
+                            revision_counter_key: "review_ux".to_string(),
+                        },
+                    );
+                    steps.insert(
+                        "revise_ux".to_string(),
+                        WorkflowStepV1::ReviseArtifact {
+                            template_id: "ux_plan_revise".to_string(),
+                            artifact_ref: "ux_plan".to_string(),
+                            feedback_key: "review_ux.feedback".to_string(),
+                            next_step: Some("review_ux".to_string()),
+                        },
+                    );
+                    steps.insert("complete".to_string(), WorkflowStepV1::Complete);
+
+                    let entry = WorkflowEntryV1 {
+                        id: id.clone(),
+                        name: name.clone(),
+                        enabled: false,
+                        workflow: WorkflowGraphV1 {
+                            entry: "generate_prd".to_string(),
+                            steps,
+                        },
+                    };
+
+                    if !apply {
+                        println!("{}", serde_json::to_string_pretty(&entry)?);
+                        return Ok(());
+                    }
+
+                    let writable_scope = ensure_writable_scope(scope, "--scope")?;
+                    let path = scoped_workflows_json_path(
+                        codex_home.as_path(),
+                        project_root.as_deref(),
+                        writable_scope,
+                    )?;
+                    let mut file = read_workflows_file_from_path(path.as_path())?;
+                    file.schema_version = "1".to_string();
+                    file.workflows.insert(id.clone(), entry);
+                    file.validate()
+                        .map_err(|err| anyhow::anyhow!("invalid workflows draft: {err}"))?;
+                    let backup = write_workflows_file(codex_home.as_path(), path.as_path(), &file)?;
+                    if let Some(path) = backup {
+                        println!("Updated workflows.json (backup: {})", path.display());
+                    } else {
+                        println!("Updated workflows.json");
+                    }
+                }
+                WorkflowsCommand::Restore {
+                    project_root,
+                    scope,
+                    backup_path,
+                } => {
+                    let project_root = discover_project_root(project_root);
+                    let writable_scope = ensure_writable_scope(scope, "--scope")?;
+                    let target = scoped_workflows_json_path(
+                        codex_home.as_path(),
+                        project_root.as_deref(),
+                        writable_scope,
+                    )?;
+                    let _ =
+                        backup_file_if_present(&target, codex_home.as_path(), "workflows_restore");
+                    let bytes = std::fs::read(&backup_path)?;
+                    if let Some(parent) = target.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(&target, bytes)?;
+                    println!(
+                        "Restored {} from {}",
+                        target.display(),
+                        backup_path.display()
+                    );
+                }
+            }
+        }
+
         Command::Backups { command } => {
             let codex_home = find_codex_home()?;
             match command {
@@ -1486,9 +1960,17 @@ pub fn run() -> Result<()> {
                             )?,
                             "pipelines_restore",
                         ),
+                        "workflows-json" => (
+                            scoped_workflows_json_path(
+                                codex_home.as_path(),
+                                project_root.as_deref(),
+                                writable_scope,
+                            )?,
+                            "workflows_restore",
+                        ),
                         other => {
                             return Err(anyhow::anyhow!(
-                                "unknown --target: {other} (expected printrevolt-toml or pipelines-json)"
+                                "unknown --target: {other} (expected printrevolt-toml or pipelines-json or workflows-json)"
                             ));
                         }
                     };

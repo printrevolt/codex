@@ -507,6 +507,215 @@ impl CommandsFileV1 {
     }
 }
 
+fn default_enabled_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowGraphV1 {
+    pub entry: String,
+    #[serde(default)]
+    pub steps: BTreeMap<String, WorkflowStepV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowEntryV1 {
+    pub id: String,
+    pub name: String,
+    #[serde(default = "default_enabled_true")]
+    pub enabled: bool,
+    pub workflow: WorkflowGraphV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "step_kind", rename_all = "snake_case")]
+pub enum WorkflowStepV1 {
+    GenerateArtifact {
+        template_id: String,
+        artifact_kind: String,
+        #[serde(default)]
+        inputs: BTreeMap<String, String>,
+        #[serde(default)]
+        next_step: Option<String>,
+    },
+    ReviewArtifact {
+        artifact_ref: String,
+        #[serde(default)]
+        prompt: String,
+        on_approved: String,
+        on_feedback: String,
+        #[serde(default = "default_max_revisions")]
+        max_revisions: u32,
+        #[serde(default)]
+        revision_counter_key: String,
+    },
+    ReviseArtifact {
+        template_id: String,
+        artifact_ref: String,
+        feedback_key: String,
+        #[serde(default)]
+        next_step: Option<String>,
+    },
+    RunPipeline {
+        pipeline_id: String,
+        #[serde(default)]
+        pipeline_scope: Option<String>,
+        #[serde(default)]
+        next_step: Option<String>,
+    },
+    Complete,
+}
+
+fn default_max_revisions() -> u32 {
+    3
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowsFileV1 {
+    pub schema_version: String,
+    #[serde(default)]
+    pub workflows: BTreeMap<String, WorkflowEntryV1>,
+}
+
+impl Default for WorkflowsFileV1 {
+    fn default() -> Self {
+        Self {
+            schema_version: "1".to_string(),
+            workflows: BTreeMap::new(),
+        }
+    }
+}
+
+impl WorkflowsFileV1 {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != "1" {
+            return Err(format!(
+                "unknown workflows.json schema_version: {} (expected 1)",
+                self.schema_version
+            ));
+        }
+        for (workflow_key, workflow) in &self.workflows {
+            if workflow_key.trim().is_empty() {
+                return Err("workflow key cannot be empty".to_string());
+            }
+            if workflow.id.trim().is_empty() {
+                return Err("workflow id cannot be empty".to_string());
+            }
+            if workflow.id != *workflow_key {
+                return Err(format!(
+                    "workflow key/id mismatch: key={} id={}",
+                    workflow_key, workflow.id
+                ));
+            }
+            if workflow.name.trim().is_empty() {
+                return Err(format!("workflow {} name cannot be empty", workflow.id));
+            }
+            if workflow.workflow.entry.trim().is_empty() {
+                return Err(format!("workflow {} entry cannot be empty", workflow.id));
+            }
+            if workflow.workflow.steps.is_empty() {
+                return Err(format!("workflow {} steps cannot be empty", workflow.id));
+            }
+            if !workflow
+                .workflow
+                .steps
+                .contains_key(&workflow.workflow.entry)
+            {
+                return Err(format!(
+                    "workflow {} entry step not found: {}",
+                    workflow.id, workflow.workflow.entry
+                ));
+            }
+
+            let mut has_complete = false;
+            for (step_key, step) in &workflow.workflow.steps {
+                if step_key.trim().is_empty() {
+                    return Err(format!("workflow {} has empty step id", workflow.id));
+                }
+                if matches!(step, WorkflowStepV1::Complete) {
+                    has_complete = true;
+                }
+                if let WorkflowStepV1::ReviewArtifact { max_revisions, .. } = step
+                    && *max_revisions == 0
+                {
+                    return Err(format!(
+                        "workflow {} step {} max_revisions must be >= 1",
+                        workflow.id, step_key
+                    ));
+                }
+                if let WorkflowStepV1::RunPipeline {
+                    pipeline_scope: Some(scope),
+                    ..
+                } = step
+                    && scope.as_str() != "global"
+                    && scope.as_str() != "project"
+                    && scope.as_str() != "effective"
+                {
+                    return Err(format!(
+                        "workflow {} step {} has invalid pipeline_scope={} (expected global|project|effective)",
+                        workflow.id, step_key, scope
+                    ));
+                }
+
+                let mut next_refs = Vec::<&str>::new();
+                match step {
+                    WorkflowStepV1::GenerateArtifact { next_step, .. }
+                    | WorkflowStepV1::ReviseArtifact { next_step, .. }
+                    | WorkflowStepV1::RunPipeline { next_step, .. } => {
+                        if let Some(next_step) = next_step.as_deref() {
+                            next_refs.push(next_step);
+                        }
+                    }
+                    WorkflowStepV1::ReviewArtifact {
+                        on_approved,
+                        on_feedback,
+                        ..
+                    } => {
+                        next_refs.push(on_approved.as_str());
+                        next_refs.push(on_feedback.as_str());
+                    }
+                    WorkflowStepV1::Complete => {}
+                }
+                for next_step in next_refs {
+                    if !workflow.workflow.steps.contains_key(next_step) {
+                        return Err(format!(
+                            "workflow {} step {} references missing step {}",
+                            workflow.id, step_key, next_step
+                        ));
+                    }
+                }
+            }
+            if !has_complete {
+                return Err(format!(
+                    "workflow {} must contain at least one complete step",
+                    workflow.id
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn merge_effective(global: Option<Self>, repo: Option<Self>) -> Result<Self, String> {
+        let mut workflows = BTreeMap::<String, WorkflowEntryV1>::new();
+        if let Some(global) = global {
+            global.validate()?;
+            for (id, workflow) in global.workflows {
+                workflows.insert(id, workflow);
+            }
+        }
+        if let Some(repo) = repo {
+            repo.validate()?;
+            for (id, workflow) in repo.workflows {
+                workflows.insert(id, workflow);
+            }
+        }
+        Ok(Self {
+            schema_version: "1".to_string(),
+            workflows,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PipelinesConfig {
@@ -525,6 +734,26 @@ impl Default for PipelinesConfig {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
+pub struct WorkflowsConfig {
+    pub enabled: bool,
+    pub max_revisions: u32,
+    pub max_artifact_bytes: u64,
+    pub max_feedback_bytes: u64,
+}
+
+impl Default for WorkflowsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_revisions: 3,
+            max_artifact_bytes: 262_144,
+            max_feedback_bytes: 8_192,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PrintRevoltConfig {
     pub enabled: bool,
     #[serde(default)]
@@ -535,6 +764,8 @@ pub struct PrintRevoltConfig {
     pub audit: AuditConfig,
     #[serde(default)]
     pub pipelines: PipelinesConfig,
+    #[serde(default)]
+    pub workflows: WorkflowsConfig,
     #[serde(default)]
     pub templates: TemplatesUiConfig,
     #[serde(default)]
@@ -553,6 +784,7 @@ impl Default for PrintRevoltConfig {
             hooks: HookConfig::default(),
             audit: AuditConfig::default(),
             pipelines: PipelinesConfig::default(),
+            workflows: WorkflowsConfig::default(),
             templates: TemplatesUiConfig::default(),
             ui: UiConfig::default(),
             agents: BTreeMap::new(),
