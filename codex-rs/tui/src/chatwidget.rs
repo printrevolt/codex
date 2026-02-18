@@ -157,6 +157,7 @@ use codex_pr_templates::Template as PrintRevoltTemplate;
 use codex_pr_templates::TemplateDiscoveryConfig as PrintRevoltTemplateDiscoveryConfig;
 use sha2::Digest as _;
 use sha2::Sha256;
+use url::Url;
 
 const DEFAULT_MODEL_DISPLAY_NAME: &str = "loading";
 const PLAN_IMPLEMENTATION_TITLE: &str = "Implement this plan?";
@@ -687,6 +688,7 @@ struct PrintRevoltDisabledSlashCommands {
     templates: bool,
     policy: bool,
     pipelines: bool,
+    providers: bool,
 }
 
 impl PrintRevoltDisabledSlashCommands {
@@ -695,8 +697,15 @@ impl PrintRevoltDisabledSlashCommands {
             templates: true,
             policy: true,
             pipelines: true,
+            providers: true,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProviderPersistScope {
+    User,
+    Project,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -813,10 +822,27 @@ fn parse_printrevolt_disabled_slash_commands_tokens<'a>(
             "templates" => out.templates = true,
             "policy" => out.policy = true,
             "pipelines" => out.pipelines = true,
+            "providers" => out.providers = true,
             _ => {}
         }
     }
     out
+}
+
+fn sanitize_base_url(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let Ok(mut url) = Url::parse(trimmed) else {
+        return None;
+    };
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    Some(url.to_string().trim_end_matches('/').to_string()).filter(|value| !value.is_empty())
 }
 
 fn now_ms() -> u64 {
@@ -6072,12 +6098,7 @@ impl ChatWidget {
                 self.open_model_popup();
             }
             SlashCommand::Provider => {
-                self.add_info_message(
-                    "`/provider` is not implemented in this build yet.".to_string(),
-                    Some("For now, set `model_provider` in config and restart.".to_string()),
-                );
-                self.bottom_pane.drain_pending_submission_state();
-                self.request_redraw();
+                self.open_provider_popup();
             }
             SlashCommand::Personality => {
                 self.open_personality_popup();
@@ -6377,8 +6398,262 @@ impl ChatWidget {
                 self.dispatch_printrevolt_pipelines_command(trimmed);
                 self.bottom_pane.drain_pending_submission_state();
             }
+            SlashCommand::Provider => {
+                self.dispatch_provider_command(trimmed);
+                self.bottom_pane.drain_pending_submission_state();
+            }
             _ => self.dispatch_command(cmd),
         }
+    }
+
+    pub(crate) fn open_provider_popup(&mut self) {
+        if !self.is_session_configured() {
+            self.add_info_message(
+                "Provider selection is disabled until startup completes.".to_string(),
+                None,
+            );
+            return;
+        }
+
+        let mut ids: Vec<&String> = self.config.model_providers.keys().collect();
+        ids.sort();
+
+        let current_provider_id = self.config.model_provider_id.as_str();
+        let mut items: Vec<SelectionItem> = Vec::new();
+        for id in ids.into_iter() {
+            let provider = &self.config.model_providers[id.as_str()];
+            let provider_name = provider.name.trim();
+            let display_name = if provider_name.is_empty() {
+                id.to_string()
+            } else {
+                format!("{provider_name} ({id})")
+            };
+
+            let base_url = provider.base_url.as_deref().and_then(sanitize_base_url);
+            let description = base_url.map(|url| format!("base_url: {url}"));
+
+            let provider_id_for_action = id.to_string();
+            let actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
+                tx.send(AppEvent::CodexOp(Op::SetModelProvider {
+                    model_provider_id: provider_id_for_action.clone(),
+                }));
+            })];
+
+            items.push(SelectionItem {
+                name: display_name,
+                description,
+                is_current: id.as_str() == current_provider_id,
+                actions,
+                dismiss_on_select: true,
+                search_value: Some(format!(
+                    "{id} {} {}",
+                    provider.name,
+                    provider.base_url.as_deref().unwrap_or("")
+                )),
+                ..Default::default()
+            });
+        }
+
+        if items.is_empty() {
+            items.push(SelectionItem {
+                name: "No providers configured".to_string(),
+                description: Some("Define model_providers in config.toml.".to_string()),
+                dismiss_on_select: true,
+                ..Default::default()
+            });
+        }
+
+        let mut header = ColumnRenderable::new();
+        header.push(Line::from("Select Provider".bold()));
+        header.push(Line::from(
+            "Switch which model provider Codex uses for this session.".dim(),
+        ));
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            header: Box::new(header),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            is_searchable: true,
+            search_placeholder: Some("Search providers…".to_string()),
+            ..Default::default()
+        });
+        self.bottom_pane.drain_pending_submission_state();
+        self.request_redraw();
+    }
+
+    fn dispatch_provider_command(&mut self, args: &str) {
+        let trimmed = args.trim();
+        if trimmed.is_empty() {
+            self.open_provider_popup();
+            return;
+        }
+
+        let tokens = trimmed.split_whitespace().collect::<Vec<_>>();
+        match tokens.as_slice() {
+            ["list"] => {
+                let mut ids: Vec<&String> = self.config.model_providers.keys().collect();
+                ids.sort();
+                if ids.is_empty() {
+                    self.add_info_message("No providers configured.".to_string(), None);
+                    return;
+                }
+
+                let mut lines: Vec<Line<'static>> = Vec::new();
+                for id in ids {
+                    let provider = &self.config.model_providers[id.as_str()];
+                    let name = provider.name.trim();
+                    let provider_name = if name.is_empty() { id.as_str() } else { name };
+                    let base_url = provider.base_url.as_deref().and_then(sanitize_base_url);
+                    let current = (id.as_str() == self.config.model_provider_id.as_str())
+                        .then_some(" (current)")
+                        .unwrap_or("");
+                    let base_url = base_url
+                        .map(|u| format!(" · {u}"))
+                        .unwrap_or_default();
+                    lines.push(Line::from(format!(
+                        "• {id} · {provider_name}{base_url}{current}"
+                    )));
+                }
+                self.add_plain_history_lines(lines);
+            }
+            ["current"] => {
+                let id = self.config.model_provider_id.clone();
+                let provider = &self.config.model_provider;
+                let name = provider.name.trim();
+                let provider_name = if name.is_empty() { id.as_str() } else { name };
+                let base_url = provider.base_url.as_deref().and_then(sanitize_base_url);
+                let msg = match base_url {
+                    Some(url) => format!("Current provider: {id} · {provider_name} · {url}"),
+                    None => format!("Current provider: {id} · {provider_name}"),
+                };
+                self.add_info_message(msg, None);
+            }
+            ["use", provider_id] => {
+                if !self.config.model_providers.contains_key(*provider_id) {
+                    self.add_error_message(format!(
+                        "Unknown provider `{provider_id}`. Try `/provider list`."
+                    ));
+                    return;
+                }
+                self.submit_op(Op::SetModelProvider {
+                    model_provider_id: provider_id.to_string(),
+                });
+            }
+            ["persist", provider_id, rest @ ..] => {
+                if !self.config.model_providers.contains_key(*provider_id) {
+                    self.add_error_message(format!(
+                        "Unknown provider `{provider_id}`. Try `/provider list`."
+                    ));
+                    return;
+                }
+
+                let mut scope = ProviderPersistScope::User;
+                let mut i = 0;
+                while i < rest.len() {
+                    match rest[i] {
+                        "--scope" if i + 1 < rest.len() => {
+                            scope = match rest[i + 1] {
+                                "user" => ProviderPersistScope::User,
+                                "project" => ProviderPersistScope::Project,
+                                other => {
+                                    self.add_error_message(format!(
+                                        "Unknown scope `{other}`. Use `user` or `project`."
+                                    ));
+                                    return;
+                                }
+                            };
+                            i += 2;
+                        }
+                        other => {
+                            self.add_error_message(format!("Unknown argument `{other}`."));
+                            return;
+                        }
+                    }
+                }
+
+                self.open_provider_persist_confirmation(provider_id.to_string(), scope);
+            }
+            _ => {
+                self.add_plain_history_lines(vec![
+                    Line::from("Usage:".bold()),
+                    Line::from("  /provider".dim()),
+                    Line::from("  /provider list".dim()),
+                    Line::from("  /provider current".dim()),
+                    Line::from("  /provider use <provider_id>".dim()),
+                    Line::from("  /provider persist <provider_id> [--scope user|project]".dim()),
+                ]);
+            }
+        }
+    }
+
+    fn open_provider_persist_confirmation(
+        &mut self,
+        provider_id: String,
+        scope: ProviderPersistScope,
+    ) {
+        let config_path = self.config.codex_home.join("config.toml");
+        let profile = self.config.active_profile.as_deref();
+        let scope_label = match (scope, profile) {
+            (ProviderPersistScope::User, Some(profile)) => {
+                format!("user (profile: {profile})")
+            }
+            (ProviderPersistScope::User, None) => "user (default)".to_string(),
+            (ProviderPersistScope::Project, _) => "project".to_string(),
+        };
+
+        let mut body = format!("Scope: {scope_label}\nmodel_provider -> {provider_id}\n");
+        if scope == ProviderPersistScope::Project {
+            body.push_str(&format!("project -> {}\n", self.config.cwd.display()));
+        }
+        body.push_str(&format!("\nFile: {}", config_path.display()));
+
+        let header = Paragraph::new(body).wrap(Wrap { trim: false });
+
+        let apply_provider_id = provider_id.clone();
+        let apply_project_path = self.config.cwd.clone();
+        let apply_scope = scope;
+        let items = vec![
+            SelectionItem {
+                name: "Apply".to_string(),
+                description: Some("Write config change (review-first).".to_string()),
+                actions: vec![Box::new(move |tx| {
+                    tx.send(AppEvent::CodexOp(Op::SetModelProvider {
+                        model_provider_id: apply_provider_id.clone(),
+                    }));
+                    match apply_scope {
+                        ProviderPersistScope::User => {
+                            tx.send(AppEvent::PersistModelProviderSelection {
+                                model_provider_id: apply_provider_id.clone(),
+                            });
+                        }
+                        ProviderPersistScope::Project => {
+                            tx.send(AppEvent::PersistProjectModelProviderSelection {
+                                project_path: apply_project_path.clone(),
+                                model_provider_id: apply_provider_id.clone(),
+                            });
+                        }
+                    }
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "Cancel".to_string(),
+                description: Some("Do not change anything.".to_string()),
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+        ];
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Persist provider selection?".to_string()),
+            subtitle: None,
+            header: Box::new(header),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
+        self.request_redraw();
     }
 
     fn dispatch_printrevolt_templates_command(&mut self, args: &str) {
@@ -7357,6 +7632,7 @@ impl ChatWidget {
             SlashCommand::Templates => self.printrevolt_disabled_slash_commands.templates,
             SlashCommand::Policy => self.printrevolt_disabled_slash_commands.policy,
             SlashCommand::Pipelines => self.printrevolt_disabled_slash_commands.pipelines,
+            SlashCommand::Provider => self.printrevolt_disabled_slash_commands.providers,
             _ => false,
         };
         if !disabled {

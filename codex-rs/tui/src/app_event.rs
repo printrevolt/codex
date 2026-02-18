@@ -236,6 +236,19 @@ pub(crate) enum AppEvent {
         effort: Option<ReasoningEffort>,
     },
 
+    /// Persist the selected model provider id to the appropriate config.
+    ///
+    /// Uses the active profile when present (same persistence behavior as model selection).
+    PersistModelProviderSelection {
+        model_provider_id: String,
+    },
+
+    /// Persist a per-project model provider override under `[projects."<path>"]`.
+    PersistProjectModelProviderSelection {
+        project_path: PathBuf,
+        model_provider_id: String,
+    },
+
     /// Persist the selected personality to the appropriate config.
     PersistPersonalitySelection {
         personality: Personality,

@@ -2066,6 +2066,68 @@ impl App {
                     }
                 }
             }
+            AppEvent::PersistModelProviderSelection { model_provider_id } => {
+                let profile = self.active_profile.as_deref();
+                match ConfigEditsBuilder::new(&self.config.codex_home)
+                    .with_profile(profile)
+                    .set_model_provider(Some(model_provider_id.as_str()))
+                    .apply()
+                    .await
+                {
+                    Ok(()) => {
+                        let mut message = format!("Provider changed to {model_provider_id}");
+                        if let Some(profile) = profile {
+                            message.push_str(" for ");
+                            message.push_str(profile);
+                            message.push_str(" profile");
+                        }
+                        self.chat_widget.add_info_message(message, None);
+                    }
+                    Err(err) => {
+                        tracing::error!(
+                            error = %err,
+                            "failed to persist model provider selection"
+                        );
+                        if let Some(profile) = profile {
+                            self.chat_widget.add_error_message(format!(
+                                "Failed to save provider for profile `{profile}`: {err}"
+                            ));
+                        } else {
+                            self.chat_widget.add_error_message(format!(
+                                "Failed to save default provider: {err}"
+                            ));
+                        }
+                    }
+                }
+            }
+            AppEvent::PersistProjectModelProviderSelection {
+                project_path,
+                model_provider_id,
+            } => match ConfigEditsBuilder::new(&self.config.codex_home)
+                .set_project_model_provider(project_path.as_path(), model_provider_id.as_str())
+                .apply()
+                .await
+            {
+                Ok(()) => {
+                    self.chat_widget.add_info_message(
+                        format!(
+                            "Provider override set for {} -> {model_provider_id}",
+                            project_path.display()
+                        ),
+                        None,
+                    );
+                }
+                Err(err) => {
+                    tracing::error!(
+                        error = %err,
+                        "failed to persist project model provider selection"
+                    );
+                    self.chat_widget.add_error_message(format!(
+                        "Failed to save project provider override for {}: {err}",
+                        project_path.display()
+                    ));
+                }
+            },
             AppEvent::PersistPersonalitySelection { personality } => {
                 let profile = self.active_profile.as_deref();
                 match ConfigEditsBuilder::new(&self.config.codex_home)
