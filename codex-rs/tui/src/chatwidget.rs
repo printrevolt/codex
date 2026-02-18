@@ -7982,10 +7982,12 @@ impl ChatWidget {
                 ..
             }) => {
                 if !from_replay && self.printrevolt_pending_template_generation.is_some() {
-                    let reason = if additional_details.trim().is_empty() {
-                        message.clone()
+                    let reason = if let Some(details) = additional_details.as_deref()
+                        && !details.trim().is_empty()
+                    {
+                        format!("{message}\n{details}")
                     } else {
-                        format!("{message}\n{additional_details}")
+                        message.clone()
                     };
                     self.abort_printrevolt_template_generation(reason);
                 }

@@ -498,6 +498,7 @@ mod tests {
                 connectors_enabled: false,
                 personality_command_enabled: true,
                 windows_degraded_sandbox_active: false,
+                ..Default::default()
             },
         );
         popup.on_composer_text_change("/collab".to_string());
@@ -517,6 +518,7 @@ mod tests {
                 connectors_enabled: false,
                 personality_command_enabled: true,
                 windows_degraded_sandbox_active: false,
+                ..Default::default()
             },
         );
         popup.on_composer_text_change("/plan".to_string());
@@ -536,6 +538,7 @@ mod tests {
                 connectors_enabled: false,
                 personality_command_enabled: false,
                 windows_degraded_sandbox_active: false,
+                ..Default::default()
             },
         );
         popup.on_composer_text_change("/pers".to_string());
@@ -563,6 +566,7 @@ mod tests {
                 connectors_enabled: false,
                 personality_command_enabled: true,
                 windows_degraded_sandbox_active: false,
+                ..Default::default()
             },
         );
         popup.on_composer_text_change("/personality".to_string());

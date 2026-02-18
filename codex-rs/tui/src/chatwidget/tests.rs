@@ -1044,6 +1044,7 @@ async fn make_chatwidget_manual(
     let auth_manager =
         codex_core::test_support::auth_manager_from_auth(CodexAuth::from_api_key("test"));
     let codex_home = cfg.codex_home.clone();
+    let printrevolt_templates_mru = TemplatesMruStore::load(&codex_home);
     let models_manager = Arc::new(ModelsManager::new(codex_home, auth_manager.clone()));
     let reasoning_effort = None;
     let base_mode = CollaborationMode {
@@ -1128,6 +1129,16 @@ async fn make_chatwidget_manual(
         status_line_branch_pending: false,
         status_line_branch_lookup_complete: false,
         external_editor_state: ExternalEditorState::Closed,
+        printrevolt_config: codex_pr_types::PrintRevoltConfig::default(),
+        printrevolt_project_root: None,
+        printrevolt_repo_trusted: false,
+        printrevolt_disabled_slash_commands: Default::default(),
+        printrevolt_templates_mru,
+        printrevolt_templates_sessions: HashMap::new(),
+        printrevolt_pending_templates_submission: None,
+        printrevolt_pending_templates_review: None,
+        printrevolt_pending_template_draft_wizard: None,
+        printrevolt_pending_template_generation: None,
     };
     widget.set_model(&resolved_model);
     (widget, rx, op_rx)
