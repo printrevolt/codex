@@ -2141,6 +2141,7 @@ dependencies = [
  "codex-pr-config",
  "codex-pr-pipelines",
  "codex-pr-repo-ops",
+ "codex-pr-runtime",
  "codex-pr-templates",
  "codex-pr-types",
  "codex-pr-updater",

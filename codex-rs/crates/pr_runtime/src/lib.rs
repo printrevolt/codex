@@ -1,7 +1,10 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Arc;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use anyhow::Result;
 use codex_pr_audit::AuditAfterTool;
@@ -27,6 +30,60 @@ use codex_pr_types::ToolOutcome;
 use codex_pr_types::VerifyEvidence;
 use codex_protocol::ThreadId;
 use tokio::sync::Mutex;
+
+#[derive(Debug, Clone)]
+pub struct WorkflowAgentInvokeRequest {
+    pub prompt: String,
+    pub cwd: Option<PathBuf>,
+    pub model: Option<String>,
+}
+
+pub fn invoke_workflow_agent(req: &WorkflowAgentInvokeRequest) -> Result<String> {
+    let codex_bin =
+        std::env::var("PRINTREVOLT_WORKFLOW_CODEX_BIN").unwrap_or_else(|_| "codex".to_string());
+    let out_path = workflow_last_message_path();
+
+    let mut cmd = Command::new(codex_bin);
+    cmd.arg("exec")
+        .arg("--skip-git-repo-check")
+        .arg("--ephemeral")
+        .arg("--output-last-message")
+        .arg(&out_path)
+        .arg(&req.prompt);
+    if let Some(model) = req.model.as_deref() {
+        cmd.arg("--model").arg(model);
+    }
+    if let Some(cwd) = req.cwd.as_deref() {
+        cmd.arg("--cd").arg(cwd);
+    }
+
+    let output = cmd.output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        anyhow::bail!(
+            "workflow agent invocation failed (status={}): stdout={} stderr={}",
+            output.status,
+            stdout.trim(),
+            stderr.trim()
+        );
+    }
+
+    let text = std::fs::read_to_string(&out_path)?;
+    let _ = std::fs::remove_file(&out_path);
+    Ok(text)
+}
+
+fn workflow_last_message_path() -> PathBuf {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "printrevolt-workflow-last-message-{}-{now}.txt",
+        std::process::id()
+    ))
+}
 
 #[cfg(feature = "probe")]
 pub mod probe {
@@ -95,10 +152,10 @@ impl PrRuntime {
         probe::record(probe::LifecycleEvent::SessionStart { session_id });
 
         let mut guard = self.state.lock().await;
-        if guard.init.is_none() {
-            if let Err(err) = guard.initialize(codex_home.to_path_buf(), cwd).await {
-                tracing::warn!(error = %err, "failed to initialize printrevolt runtime");
-            }
+        if guard.init.is_none()
+            && let Err(err) = guard.initialize(codex_home.to_path_buf(), cwd).await
+        {
+            tracing::warn!(error = %err, "failed to initialize printrevolt runtime");
         }
         if let Some(init) = guard.init.as_ref()
             && let Some(audit) = init.audit.as_ref()
@@ -170,51 +227,51 @@ impl PrRuntime {
 
         // Hook decision first (may modify).
         let mut candidate = call.clone();
-        if init.cfg.hooks.enabled {
-            if let Some(def) = init.cfg.hooks.before_tool.clone() {
-                if def.is_repo_provided && !init.is_trusted_repo() {
-                    // Repo hook exists but repo untrusted: allow, but do not run headlessly.
-                } else {
-                    let hook = HookSpec {
-                        argv: def.argv,
-                        timeout_ms: def.timeout_ms,
-                        headless_only: def.headless_only,
-                        is_repo_provided: def.is_repo_provided,
-                    };
-                    let payload = HookPayloadV2 {
-                        ctx: ctx.clone(),
-                        event_kind: LifecycleEventKind::BeforeTool,
-                        tool_call: Some(candidate.clone()),
-                        tool_outcome: None,
-                        vars: init.vars.clone(),
-                    };
-                    match init.hook_runner.run_hook(&hook, &payload).await {
-                        Ok(resp) => {
-                            if let Some(audit) = init.audit.as_ref() {
-                                let _ = audit.write_json(&AuditEvent {
-                                    kind: AuditEventKind::HookDecision,
-                                    payload: AuditDecision {
-                                        tool_call: candidate.clone(),
-                                        decision: resp.decision.clone(),
-                                    },
-                                });
-                            }
-                            match resp.decision.kind {
-                                DecisionKind::Allow => {}
-                                DecisionKind::Block => return resp.decision,
-                                DecisionKind::Modify => {
-                                    if let Some(modified) = resp.decision.modified_call.clone() {
-                                        candidate = modified;
-                                    }
+        if init.cfg.hooks.enabled
+            && let Some(def) = init.cfg.hooks.before_tool.clone()
+        {
+            if def.is_repo_provided && !init.is_trusted_repo() {
+                // Repo hook exists but repo untrusted: allow, but do not run headlessly.
+            } else {
+                let hook = HookSpec {
+                    argv: def.argv,
+                    timeout_ms: def.timeout_ms,
+                    headless_only: def.headless_only,
+                    is_repo_provided: def.is_repo_provided,
+                };
+                let payload = HookPayloadV2 {
+                    ctx: ctx.clone(),
+                    event_kind: LifecycleEventKind::BeforeTool,
+                    tool_call: Some(candidate.clone()),
+                    tool_outcome: None,
+                    vars: init.vars.clone(),
+                };
+                match init.hook_runner.run_hook(&hook, &payload).await {
+                    Ok(resp) => {
+                        if let Some(audit) = init.audit.as_ref() {
+                            let _ = audit.write_json(&AuditEvent {
+                                kind: AuditEventKind::HookDecision,
+                                payload: AuditDecision {
+                                    tool_call: candidate.clone(),
+                                    decision: resp.decision.clone(),
+                                },
+                            });
+                        }
+                        match resp.decision.kind {
+                            DecisionKind::Allow => {}
+                            DecisionKind::Block => return resp.decision,
+                            DecisionKind::Modify => {
+                                if let Some(modified) = resp.decision.modified_call {
+                                    candidate = modified;
                                 }
                             }
                         }
-                        Err(err) => {
-                            return ToolCallDecision::block(
-                                "PrHookFailed",
-                                format!("Hook failed: {err}"),
-                            );
-                        }
+                    }
+                    Err(err) => {
+                        return ToolCallDecision::block(
+                            "PrHookFailed",
+                            format!("Hook failed: {err}"),
+                        );
                     }
                 }
             }

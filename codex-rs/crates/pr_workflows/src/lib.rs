@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use chrono::DateTime;
 use chrono::Utc;
+use codex_pr_types::WorkflowComponentV1;
 use codex_pr_types::WorkflowEntryV1;
 use codex_pr_types::WorkflowGraphV1;
 use codex_pr_types::WorkflowStepV1;
@@ -235,6 +236,7 @@ impl Default for WorkflowEngineLimits {
 #[derive(Debug, Clone)]
 pub struct WorkflowEngine {
     graph: WorkflowGraphV1,
+    components: BTreeMap<String, WorkflowComponentV1>,
     limits: WorkflowEngineLimits,
 }
 
@@ -269,6 +271,8 @@ pub enum PendingAction {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowRunState {
     pub run_id: String,
+    #[serde(default)]
+    pub workflow_id: Option<String>,
     pub current_step_id: String,
     pub status: WorkflowRunStatus,
     #[serde(default)]
@@ -345,13 +349,124 @@ impl WorkflowEngine {
         graph: WorkflowGraphV1,
         limits: WorkflowEngineLimits,
     ) -> Result<Self, WorkflowError> {
-        validate_graph(&graph)?;
-        Ok(Self { graph, limits })
+        Self::new_with_components(graph, BTreeMap::new(), limits)
+    }
+
+    pub fn new_with_components(
+        graph: WorkflowGraphV1,
+        components: BTreeMap<String, WorkflowComponentV1>,
+        limits: WorkflowEngineLimits,
+    ) -> Result<Self, WorkflowError> {
+        validate_graph(&graph, &components)?;
+        Ok(Self {
+            graph,
+            components,
+            limits,
+        })
+    }
+
+    pub fn action_for_pending(
+        &self,
+        state: &WorkflowRunState,
+    ) -> Result<Option<WorkflowAction>, WorkflowError> {
+        let Some(pending) = state.pending.as_ref() else {
+            return Ok(None);
+        };
+        let step = self.materialize_step(&state.current_step_id)?;
+        let action = match (pending, step) {
+            (
+                PendingAction::InvokeAgent {
+                    step_id,
+                    artifact_ref,
+                    artifact_kind,
+                    ..
+                },
+                WorkflowStepV1::GenerateArtifact {
+                    template_id,
+                    inputs,
+                    ..
+                },
+            ) => WorkflowAction::InvokeAgent {
+                run_id: state.run_id.clone(),
+                step_id: step_id.clone(),
+                template_id,
+                artifact_ref: artifact_ref.clone(),
+                artifact_kind: artifact_kind.clone(),
+                inputs,
+                feedback: None,
+            },
+            (
+                PendingAction::InvokeAgent {
+                    step_id,
+                    artifact_ref,
+                    artifact_kind,
+                    ..
+                },
+                WorkflowStepV1::ReviseArtifact {
+                    template_id,
+                    feedback_key,
+                    ..
+                },
+            ) => WorkflowAction::InvokeAgent {
+                run_id: state.run_id.clone(),
+                step_id: step_id.clone(),
+                template_id,
+                artifact_ref: artifact_ref.clone(),
+                artifact_kind: artifact_kind.clone(),
+                inputs: BTreeMap::new(),
+                feedback: state.feedback.get(&feedback_key).cloned(),
+            },
+            (
+                PendingAction::ReviewArtifact { step_id },
+                WorkflowStepV1::ReviewArtifact {
+                    artifact_ref,
+                    prompt,
+                    max_revisions,
+                    revision_counter_key,
+                    ..
+                },
+            ) => {
+                let counter_key = revision_counter_lookup_key(step_id, &revision_counter_key);
+                let current_revisions = state
+                    .revision_counters
+                    .get(&counter_key)
+                    .copied()
+                    .unwrap_or(0);
+                WorkflowAction::RequestReview {
+                    run_id: state.run_id.clone(),
+                    step_id: step_id.clone(),
+                    artifact_ref,
+                    prompt,
+                    max_revisions,
+                    current_revisions,
+                }
+            }
+            (
+                PendingAction::RunPipeline { step_id, .. },
+                WorkflowStepV1::RunPipeline {
+                    pipeline_id,
+                    pipeline_scope,
+                    ..
+                },
+            ) => WorkflowAction::RunPipeline {
+                run_id: state.run_id.clone(),
+                step_id: step_id.clone(),
+                pipeline_id,
+                pipeline_scope,
+            },
+            _ => {
+                return Err(WorkflowError::InvalidRunState(
+                    "pending action does not match current step".to_string(),
+                ));
+            }
+        };
+        Ok(Some(action))
     }
 
     pub fn start(&self, run_id: impl Into<String>) -> WorkflowRunState {
         WorkflowRunState {
             run_id: run_id.into(),
+            workflow_id: None,
             current_step_id: self.graph.entry.clone(),
             status: WorkflowRunStatus::Running,
             revision_counters: BTreeMap::new(),
@@ -375,13 +490,9 @@ impl WorkflowEngine {
             ));
         }
 
-        let step = self
-            .graph
-            .steps
-            .get(&state.current_step_id)
-            .ok_or_else(|| WorkflowError::MissingStep(state.current_step_id.clone()))?;
+        let step = self.materialize_step(&state.current_step_id)?;
 
-        match step {
+        match &step {
             WorkflowStepV1::GenerateArtifact {
                 template_id,
                 artifact_kind,
@@ -398,9 +509,9 @@ impl WorkflowEngine {
                 Ok(Some(WorkflowAction::InvokeAgent {
                     run_id: state.run_id.clone(),
                     step_id: state.current_step_id.clone(),
-                    template_id: template_id.clone(),
-                    artifact_ref: artifact_kind.clone(),
-                    artifact_kind: artifact_kind.clone(),
+                    template_id: template_id.to_string(),
+                    artifact_ref: artifact_kind.to_string(),
+                    artifact_kind: artifact_kind.to_string(),
                     inputs: inputs.clone(),
                     feedback: None,
                 }))
@@ -426,8 +537,8 @@ impl WorkflowEngine {
                 Ok(Some(WorkflowAction::RequestReview {
                     run_id: state.run_id.clone(),
                     step_id: state.current_step_id.clone(),
-                    artifact_ref: artifact_ref.clone(),
-                    prompt: prompt.clone(),
+                    artifact_ref: artifact_ref.to_string(),
+                    prompt: prompt.to_string(),
                     max_revisions: *max_revisions,
                     current_revisions,
                 }))
@@ -453,9 +564,9 @@ impl WorkflowEngine {
                 Ok(Some(WorkflowAction::InvokeAgent {
                     run_id: state.run_id.clone(),
                     step_id: state.current_step_id.clone(),
-                    template_id: template_id.clone(),
-                    artifact_ref: artifact_ref.clone(),
-                    artifact_kind: artifact_ref.clone(),
+                    template_id: template_id.to_string(),
+                    artifact_ref: artifact_ref.to_string(),
+                    artifact_kind: artifact_ref.to_string(),
                     inputs: BTreeMap::new(),
                     feedback: Some(feedback),
                 }))
@@ -473,7 +584,7 @@ impl WorkflowEngine {
                 Ok(Some(WorkflowAction::RunPipeline {
                     run_id: state.run_id.clone(),
                     step_id: state.current_step_id.clone(),
-                    pipeline_id: pipeline_id.clone(),
+                    pipeline_id: pipeline_id.to_string(),
                     pipeline_scope: pipeline_scope.clone(),
                 }))
             }
@@ -484,6 +595,9 @@ impl WorkflowEngine {
                     step_id: state.current_step_id.clone(),
                 }))
             }
+            WorkflowStepV1::UseComponent { .. } => Err(WorkflowError::InvalidRunState(
+                "use_component must be materialized before execution".to_string(),
+            )),
         }
     }
 
@@ -544,11 +658,7 @@ impl WorkflowEngine {
                         "review result step mismatch: pending={step_id} action={action_step_id}"
                     )));
                 }
-                let step = self
-                    .graph
-                    .steps
-                    .get(&step_id)
-                    .ok_or_else(|| WorkflowError::MissingStep(step_id.clone()))?;
+                let step = self.materialize_step(&step_id)?;
                 let WorkflowStepV1::ReviewArtifact {
                     on_approved,
                     on_feedback,
@@ -565,7 +675,7 @@ impl WorkflowEngine {
                 state.pending = None;
                 if approved {
                     state.status = WorkflowRunStatus::Running;
-                    state.current_step_id = on_approved.clone();
+                    state.current_step_id = on_approved;
                     return Ok(());
                 }
 
@@ -575,12 +685,12 @@ impl WorkflowEngine {
                     step_id: &step_id,
                     feedback_key: &format!(
                         "{}.feedback",
-                        revision_counter_lookup_key(&step_id, revision_counter_key)
+                        revision_counter_lookup_key(&step_id, &revision_counter_key)
                     ),
                     feedback: &feedback_text,
                 })?;
 
-                let counter_key = revision_counter_lookup_key(&step_id, revision_counter_key);
+                let counter_key = revision_counter_lookup_key(&step_id, &revision_counter_key);
                 let counter = state
                     .revision_counters
                     .entry(counter_key.clone())
@@ -590,10 +700,10 @@ impl WorkflowEngine {
                 let key_for_feedback = format!("{counter_key}.feedback");
                 state.feedback.insert(key_for_feedback, feedback_text);
 
-                let effective_max = if *max_revisions == 0 {
+                let effective_max = if max_revisions == 0 {
                     self.limits.default_max_revisions
                 } else {
-                    *max_revisions
+                    max_revisions
                 };
 
                 if *counter > effective_max {
@@ -606,7 +716,7 @@ impl WorkflowEngine {
                 }
 
                 state.status = WorkflowRunStatus::Running;
-                state.current_step_id = on_feedback.clone();
+                state.current_step_id = on_feedback;
                 Ok(())
             }
             (
@@ -636,6 +746,54 @@ impl WorkflowEngine {
             )),
         }
     }
+
+    fn materialize_step(&self, step_id: &str) -> Result<WorkflowStepV1, WorkflowError> {
+        let step = self
+            .graph
+            .steps
+            .get(step_id)
+            .ok_or_else(|| WorkflowError::MissingStep(step_id.to_string()))?
+            .clone();
+        let WorkflowStepV1::UseComponent {
+            component_id,
+            next_step,
+            ..
+        } = step
+        else {
+            return Ok(step);
+        };
+        let component = self
+            .components
+            .get(&component_id)
+            .ok_or_else(|| WorkflowError::MissingStep(component_id.clone()))?;
+        let mut component_step = component.step.clone();
+        match &mut component_step {
+            WorkflowStepV1::GenerateArtifact {
+                next_step: component_next,
+                ..
+            }
+            | WorkflowStepV1::ReviseArtifact {
+                next_step: component_next,
+                ..
+            }
+            | WorkflowStepV1::RunPipeline {
+                next_step: component_next,
+                ..
+            } => {
+                if next_step.is_some() {
+                    *component_next = next_step;
+                }
+            }
+            WorkflowStepV1::ReviewArtifact { .. }
+            | WorkflowStepV1::UseComponent { .. }
+            | WorkflowStepV1::Complete => {
+                return Err(WorkflowError::InvalidRunState(format!(
+                    "component {component_id} has unsupported step for use_component"
+                )));
+            }
+        }
+        Ok(component_step)
+    }
 }
 
 pub fn write_run_state(path: &Path, state: &WorkflowRunState) -> Result<(), WorkflowError> {
@@ -660,7 +818,10 @@ pub fn action_result_from_json(json: &str) -> Result<WorkflowActionResult, Workf
     Ok(serde_json::from_str::<WorkflowActionResult>(json)?)
 }
 
-fn validate_graph(graph: &WorkflowGraphV1) -> Result<(), WorkflowError> {
+fn validate_graph(
+    graph: &WorkflowGraphV1,
+    components: &BTreeMap<String, WorkflowComponentV1>,
+) -> Result<(), WorkflowError> {
     let mut workflows = BTreeMap::<String, WorkflowEntryV1>::new();
     workflows.insert(
         "_validation".to_string(),
@@ -673,6 +834,7 @@ fn validate_graph(graph: &WorkflowGraphV1) -> Result<(), WorkflowError> {
     );
     let file = WorkflowsFileV1 {
         schema_version: WORKFLOWS_SCHEMA_VERSION.to_string(),
+        components: components.clone(),
         workflows,
     };
     file.validate().map_err(WorkflowError::Validation)

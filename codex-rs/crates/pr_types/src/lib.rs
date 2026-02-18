@@ -94,14 +94,14 @@ pub mod templating {
                     return ctx
                         .vars
                         .get(rest)
-                        .map(|s| s.as_str())
+                        .map(std::string::String::as_str)
                         .ok_or_else(|| TemplateError::MissingVar(rest.to_string()));
                 }
                 if let Some(rest) = key.strip_prefix("fact.") {
                     return ctx
                         .facts
                         .get(rest)
-                        .map(|s| s.as_str())
+                        .map(std::string::String::as_str)
                         .ok_or_else(|| TemplateError::MissingFact(rest.to_string()));
                 }
                 Err(TemplateError::UnknownPlaceholder(key.to_string()))
@@ -151,34 +151,22 @@ pub mod templating {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum TemplateSelectionMode {
+    #[default]
     Off,
     Once,
     EveryTime,
 }
 
-impl Default for TemplateSelectionMode {
-    fn default() -> Self {
-        Self::Off
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct TemplatesUiConfig {
     pub selection_mode: TemplateSelectionMode,
     /// Template id highlighted in the picker when the picker is shown.
     /// Empty string means "none".
     pub default_for_picker_template_id: String,
-}
-
-impl Default for TemplatesUiConfig {
-    fn default() -> Self {
-        Self {
-            selection_mode: TemplateSelectionMode::default(),
-            default_for_picker_template_id: String::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -191,33 +179,19 @@ pub struct TemplatesUiOverrides {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct UiConfig {
     /// Slash command groups disabled by a supervisor UI (e.g., Command Center).
     /// Example values: "templates", "pipelines", "policy".
     pub disabled_slash_commands: Vec<String>,
 }
 
-impl Default for UiConfig {
-    fn default() -> Self {
-        Self {
-            disabled_slash_commands: Vec::new(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct AgentConfig {
     #[serde(default)]
     pub templates: TemplatesUiOverrides,
-}
-
-impl Default for AgentConfig {
-    fn default() -> Self {
-        Self {
-            templates: TemplatesUiOverrides::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -424,16 +398,12 @@ impl Default for AuditConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ChildProcessPolicy {
+    #[default]
     Inherit,
     AuditAllowlist,
     EnforceAllowlist,
-}
-
-impl Default for ChildProcessPolicy {
-    fn default() -> Self {
-        Self::Inherit
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -519,6 +489,19 @@ pub struct WorkflowGraphV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowParamSpecV1 {
+    #[serde(default)]
+    pub default: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowComponentV1 {
+    #[serde(default)]
+    pub params: BTreeMap<String, WorkflowParamSpecV1>,
+    pub step: WorkflowStepV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowEntryV1 {
     pub id: String,
     pub name: String,
@@ -563,6 +546,13 @@ pub enum WorkflowStepV1 {
         #[serde(default)]
         next_step: Option<String>,
     },
+    UseComponent {
+        component_id: String,
+        #[serde(default)]
+        args: BTreeMap<String, String>,
+        #[serde(default)]
+        next_step: Option<String>,
+    },
     Complete,
 }
 
@@ -574,6 +564,8 @@ fn default_max_revisions() -> u32 {
 pub struct WorkflowsFileV1 {
     pub schema_version: String,
     #[serde(default)]
+    pub components: BTreeMap<String, WorkflowComponentV1>,
+    #[serde(default)]
     pub workflows: BTreeMap<String, WorkflowEntryV1>,
 }
 
@@ -581,6 +573,7 @@ impl Default for WorkflowsFileV1 {
     fn default() -> Self {
         Self {
             schema_version: "1".to_string(),
+            components: BTreeMap::new(),
             workflows: BTreeMap::new(),
         }
     }
@@ -593,6 +586,26 @@ impl WorkflowsFileV1 {
                 "unknown workflows.json schema_version: {} (expected 1)",
                 self.schema_version
             ));
+        }
+        for (component_id, component) in &self.components {
+            if component_id.trim().is_empty() {
+                return Err("component id cannot be empty".to_string());
+            }
+            match &component.step {
+                WorkflowStepV1::GenerateArtifact { .. }
+                | WorkflowStepV1::ReviseArtifact { .. }
+                | WorkflowStepV1::RunPipeline { .. } => {}
+                WorkflowStepV1::UseComponent { .. } => {
+                    return Err(format!(
+                        "component {component_id} cannot contain use_component (nesting is not supported)"
+                    ));
+                }
+                WorkflowStepV1::ReviewArtifact { .. } | WorkflowStepV1::Complete => {
+                    return Err(format!(
+                        "component {component_id} step kind is not reusable (expected generate_artifact, revise_artifact, or run_pipeline)"
+                    ));
+                }
+            }
         }
         for (workflow_key, workflow) in &self.workflows {
             if workflow_key.trim().is_empty() {
@@ -656,12 +669,32 @@ impl WorkflowsFileV1 {
                         workflow.id, step_key, scope
                     ));
                 }
+                if let WorkflowStepV1::UseComponent {
+                    component_id, args, ..
+                } = step
+                {
+                    let Some(component) = self.components.get(component_id) else {
+                        return Err(format!(
+                            "workflow {} step {} references missing component {}",
+                            workflow.id, step_key, component_id
+                        ));
+                    };
+                    for arg_key in args.keys() {
+                        if !component.params.contains_key(arg_key) {
+                            return Err(format!(
+                                "workflow {} step {} arg {} is not defined in component {}",
+                                workflow.id, step_key, arg_key, component_id
+                            ));
+                        }
+                    }
+                }
 
                 let mut next_refs = Vec::<&str>::new();
                 match step {
                     WorkflowStepV1::GenerateArtifact { next_step, .. }
                     | WorkflowStepV1::ReviseArtifact { next_step, .. }
-                    | WorkflowStepV1::RunPipeline { next_step, .. } => {
+                    | WorkflowStepV1::RunPipeline { next_step, .. }
+                    | WorkflowStepV1::UseComponent { next_step, .. } => {
                         if let Some(next_step) = next_step.as_deref() {
                             next_refs.push(next_step);
                         }
@@ -696,21 +729,29 @@ impl WorkflowsFileV1 {
     }
 
     pub fn merge_effective(global: Option<Self>, repo: Option<Self>) -> Result<Self, String> {
+        let mut components = BTreeMap::<String, WorkflowComponentV1>::new();
         let mut workflows = BTreeMap::<String, WorkflowEntryV1>::new();
         if let Some(global) = global {
             global.validate()?;
+            for (id, component) in global.components {
+                components.insert(id, component);
+            }
             for (id, workflow) in global.workflows {
                 workflows.insert(id, workflow);
             }
         }
         if let Some(repo) = repo {
             repo.validate()?;
+            for (id, component) in repo.components {
+                components.insert(id, component);
+            }
             for (id, workflow) in repo.workflows {
                 workflows.insert(id, workflow);
             }
         }
         Ok(Self {
             schema_version: "1".to_string(),
+            components,
             workflows,
         })
     }

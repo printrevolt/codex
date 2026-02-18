@@ -481,12 +481,12 @@ Priority values:
 | WF-07 | Workflow engine control flow (steps + transitions + bounded revision loop) | P0 | Done | WF-06 | Implemented deterministic transitions for generate/review/revise/complete with terminal `needs_human` on bound overflow. |
 | WF-08 | Action protocol (`WorkflowAction` + results) for headless runner | P0 | Done | WF-07 | Added serde action/result protocol + JSON encode/decode helpers for supervisor mode. |
 | WF-09 | CLI: `codex-pr workflows list/show/draft/restore` | P1 | Done | WF-03, WF-04, WF-05 | CLI now consumes crate schema IO; trust-gated warnings and backups remain in place. |
-| WF-10 | CLI: `codex-pr workflows run` (interactive terminal runner) | P1 | Planned | WF-08, WF-09 | Captures approve/feedback and persists artifacts. |
-| WF-11 | Wire `InvokeAgent` to real model call path in runtime | P2 | Planned | WF-08 | Needs careful boundary: generation must not execute tools. |
-| WF-12 | Add `run_pipeline` step kind (invoke existing pipelines with expanded preview) | P2 | Planned | WF-07 | Optional for v1, required for v1.1 per acceptance criteria. |
-| WF-13 | TUI/Command Center UX: review artifact pager + feedback input | P2 | Planned | WF-10, WF-11 | Must implement cancel/resume semantics. |
-| WF-14 | Docs: update LLD + PRINTREVOLT docs for workflows | P2 | Planned | WF-01, WF-09 | Keep docs aligned with shipping behavior. |
-| WF-15 | Workflow "components" for step reuse (like pipeline components) | P3 | Planned | WF-07 | Defer until v1 is stable. |
+| WF-10 | CLI: `codex-pr workflows run` (interactive terminal runner) | P1 | Done | WF-08, WF-09 | Added `workflows run` with persisted state, interactive approval/feedback loop, and headless `--emit-actions-json` / `--action-result-json`. |
+| WF-11 | Wire `InvokeAgent` to real model call path in runtime | P2 | Done | WF-08 | Added `codex-pr-runtime::invoke_workflow_agent` to call `codex exec` with `--output-last-message` for real generation path. |
+| WF-12 | Add `run_pipeline` step kind (invoke existing pipelines with expanded preview) | P2 | Done | WF-07 | `run_pipeline` now resolves pipeline by scope, renders expanded preview, and captures success/failure decision in runner flow. |
+| WF-13 | TUI/Command Center UX: review artifact pager + feedback input | P2 | Done | WF-10, WF-11 | Implemented interactive pager + feedback capture and added `workflows status` / `workflows cancel` for resume/cancel control. |
+| WF-14 | Docs: update LLD + PRINTREVOLT docs for workflows | P2 | Done | WF-01, WF-09 | Updated workflow docs for run/status/cancel, supervisor mode, runtime invoke path, and componentized workflow drafts. |
+| WF-15 | Workflow "components" for step reuse (like pipeline components) | P3 | Done | WF-07 | Added `components` + `use_component` to `workflows.json` schema and runner materialization support for reusable workflow steps. |
 
 ## Milestones (Phased Delivery)
 

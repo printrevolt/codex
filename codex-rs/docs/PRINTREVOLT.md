@@ -101,6 +101,11 @@ codex-pr workflows draft --scope global --apply
 codex-pr workflows restore --scope global --backup-path <path>
 codex-pr workflows enable  --scope global
 codex-pr workflows disable --scope global
+codex-pr workflows run --scope both --id product_flow --prompt "Build a product"
+codex-pr workflows run --scope both --id product_flow --emit-actions-json
+codex-pr workflows run --scope both --id product_flow --resume --action-result-json '<json>'
+codex-pr workflows status --run-id <run_id> --json
+codex-pr workflows cancel --run-id <run_id>
 ```
 
 Safe defaults:
@@ -110,7 +115,13 @@ Safe defaults:
 Runtime/engine implementation notes:
 - `codex-pr-workflows` provides validated schema IO for `workflows.json`.
 - Workflow runs use a deterministic action protocol (`invoke_agent`, `request_review`, `run_pipeline`, `complete`) that can be serialized for headless supervisors.
+- `codex-pr workflows run` persists resumable run state under `<CODEX_HOME>/printrevolt/state/workflows/`.
 - Workflow artifacts/feedback are stored in a content-addressed artifact store with metadata and bounded sizes.
+- `InvokeAgent` uses runtime bridge `codex-pr-runtime::invoke_workflow_agent`, which invokes `codex exec` and reads `--output-last-message`.
+
+Workflow components (reusable step definitions):
+- `workflows.json` supports top-level `components` with step templates and `use_component` in workflow steps.
+- The starter `workflows draft --apply` writes reusable components and a `product_flow` using `use_component`.
 
 ## Command Catalogs (`commands.json`)
 

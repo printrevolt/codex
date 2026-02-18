@@ -1,6 +1,10 @@
 use std::collections::BTreeMap;
+use std::io;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use anyhow::Result;
 use clap::Parser;
@@ -19,12 +23,28 @@ use codex_pr_pipelines::expand_pipeline;
 use codex_pr_repo_ops::BranchEnsureArgs;
 use codex_pr_repo_ops::RepoOpPlan;
 use codex_pr_repo_ops::WorktreeEnsureArgs;
+use codex_pr_runtime::WorkflowAgentInvokeRequest;
+use codex_pr_runtime::invoke_workflow_agent;
+use codex_pr_types::PrintRevoltConfig;
+use codex_pr_types::WorkflowComponentV1;
 use codex_pr_types::WorkflowEntryV1;
 use codex_pr_types::WorkflowGraphV1;
 use codex_pr_types::WorkflowStepV1;
 use codex_pr_updater::UpdateChannel;
 use codex_pr_updater::UpdateCheckRequest;
+use codex_pr_workflows::ArtifactStore;
+use codex_pr_workflows::ArtifactStoreConfig;
+use codex_pr_workflows::WorkflowAction;
+use codex_pr_workflows::WorkflowActionResult;
+use codex_pr_workflows::WorkflowEngine;
+use codex_pr_workflows::WorkflowEngineLimits;
+use codex_pr_workflows::WorkflowRunState;
+use codex_pr_workflows::WorkflowRunStatus;
+use codex_pr_workflows::action_result_from_json;
+use codex_pr_workflows::action_to_json;
+use codex_pr_workflows::read_run_state;
 use codex_pr_workflows::read_workflows_file as read_workflows_file_core;
+use codex_pr_workflows::write_run_state;
 use codex_pr_workflows::write_workflows_file as write_workflows_file_core;
 use codex_utils_home_dir::find_codex_home;
 use sha2::Digest as _;
@@ -542,6 +562,67 @@ enum WorkflowsCommand {
         apply: bool,
     },
 
+    /// Run or resume a workflow and drive review gates interactively.
+    Run {
+        /// Override project root (defaults to searching upward from cwd for .git).
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+
+        /// Workflow bundle scope.
+        #[arg(long, value_enum, default_value = "both")]
+        scope: Scope,
+
+        /// Workflow id.
+        #[arg(long)]
+        id: String,
+
+        /// Run id to resume (if omitted, a new run id is generated unless --resume is set).
+        #[arg(long)]
+        run_id: Option<String>,
+
+        /// Resume the latest run state for this workflow id.
+        #[arg(long)]
+        resume: bool,
+
+        /// Initial user prompt used to compose generation prompts.
+        #[arg(long)]
+        prompt: Option<String>,
+
+        /// Optional model override for `codex exec` invocations.
+        #[arg(long)]
+        model: Option<String>,
+
+        /// Emit one pending action as JSON and exit (supervisor mode).
+        #[arg(long)]
+        emit_actions_json: bool,
+
+        /// Apply an action result JSON blob to the pending action before continuing.
+        #[arg(long)]
+        action_result_json: Option<String>,
+
+        /// Loop guard for command-side execution.
+        #[arg(long, default_value_t = 256)]
+        max_steps: u32,
+    },
+
+    /// Show the state of the latest (or selected) workflow run.
+    Status {
+        /// Run id to inspect (defaults to latest run state file).
+        #[arg(long)]
+        run_id: Option<String>,
+
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Cancel a workflow run by marking it failed and clearing pending action.
+    Cancel {
+        /// Run id to cancel (defaults to latest run state file).
+        #[arg(long)]
+        run_id: Option<String>,
+    },
+
     /// Restore workflows.json from a backup snapshot.
     Restore {
         /// Override project root (defaults to searching upward from cwd for .git).
@@ -955,10 +1036,13 @@ fn merged_workflows(
 ) -> Result<MergedWorkflows> {
     let mut out = BTreeMap::new();
     let mut warnings = Vec::<String>::new();
+    let mut global_file_for_merge = None;
+    let mut repo_file_for_merge = None;
 
     if matches!(scope, Scope::Global | Scope::Both) {
         let global_path = scoped_workflows_json_path(codex_home, project_root, LayerScope::Global)?;
         let global = read_workflows_file_from_path(global_path.as_path())?;
+        global_file_for_merge = Some(global.clone());
         for (id, entry) in global.workflows {
             out.insert(
                 id,
@@ -985,6 +1069,7 @@ fn merged_workflows(
             let project_path =
                 scoped_workflows_json_path(codex_home, Some(project_root), LayerScope::Project)?;
             let project = read_workflows_file_from_path(project_path.as_path())?;
+            repo_file_for_merge = Some(project.clone());
             for (id, entry) in project.workflows {
                 out.insert(
                     id,
@@ -999,8 +1084,14 @@ fn merged_workflows(
             }
         }
     }
+    let merged_file = codex_pr_types::WorkflowsFileV1::merge_effective(
+        global_file_for_merge,
+        repo_file_for_merge,
+    )
+    .map_err(|err| anyhow::anyhow!("invalid effective workflows file: {err}"))?;
     Ok(MergedWorkflows {
         entries: out,
+        components: merged_file.components,
         warnings,
     })
 }
@@ -1008,6 +1099,7 @@ fn merged_workflows(
 #[derive(Debug, Clone)]
 struct MergedWorkflows {
     entries: BTreeMap<String, WorkflowResolvedEntryV1>,
+    components: BTreeMap<String, WorkflowComponentV1>,
     warnings: Vec<String>,
 }
 
@@ -1115,6 +1207,543 @@ fn discover_templates_for_scope(
                 trusted,
                 codex_pr_templates::TemplateDiscoveryConfig::default(),
             )
+        }
+    }
+}
+
+fn effective_printrevolt_config(
+    codex_home: &Path,
+    project_root: Option<&Path>,
+) -> PrintRevoltConfig {
+    let resolved = resolve_printrevolt_config(codex_home, project_root, None);
+    let cfg_toml = toml::to_string(&resolved.printrevolt).unwrap_or_default();
+    toml::from_str::<PrintRevoltConfig>(&cfg_toml).unwrap_or_default()
+}
+
+fn workflows_state_root(codex_home: &Path) -> PathBuf {
+    codex_home
+        .join("printrevolt")
+        .join("state")
+        .join("workflows")
+}
+
+fn workflow_run_state_path(codex_home: &Path, run_id: &str) -> PathBuf {
+    workflows_state_root(codex_home).join(format!("{run_id}.json"))
+}
+
+fn workflow_artifacts_root(codex_home: &Path) -> PathBuf {
+    codex_home
+        .join("printrevolt")
+        .join("artifacts")
+        .join("workflows")
+}
+
+fn sanitize_run_id(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        return "workflow-run".to_string();
+    }
+    out
+}
+
+fn generate_run_id(workflow_id: &str) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format!("{}-{now}", sanitize_run_id(workflow_id))
+}
+
+fn find_latest_workflow_run_id(codex_home: &Path, workflow_id: Option<&str>) -> Option<String> {
+    let root = workflows_state_root(codex_home);
+    let entries = std::fs::read_dir(root).ok()?;
+    let mut latest: Option<(SystemTime, String)> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        if let Some(workflow_id) = workflow_id {
+            let Ok(state) = read_run_state(&path) else {
+                continue;
+            };
+            if state.workflow_id.as_deref() != Some(workflow_id) {
+                continue;
+            }
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        match &latest {
+            Some((ts, _)) if &modified <= ts => {}
+            _ => latest = Some((modified, stem.to_string())),
+        }
+    }
+    latest.map(|(_, id)| id)
+}
+
+fn find_template_by_id<'a>(
+    templates: &'a [codex_pr_templates::Template],
+    template_id: &str,
+) -> Option<&'a codex_pr_templates::Template> {
+    if let Some(t) = templates.iter().find(|t| t.id == template_id) {
+        return Some(t);
+    }
+    templates.iter().find(|t| {
+        let id_tail =
+            t.id.split(':')
+                .next_back()
+                .unwrap_or(t.id.as_str())
+                .trim_end_matches(".md");
+        id_tail == template_id || t.name.eq_ignore_ascii_case(template_id)
+    })
+}
+
+fn prompt_yes_no(question: &str, default_yes: bool) -> Result<bool> {
+    let default_hint = if default_yes { "Y/n" } else { "y/N" };
+    print!("{question} [{default_hint}]: ");
+    io::stdout().flush()?;
+    let mut buf = String::new();
+    io::stdin().read_line(&mut buf)?;
+    let answer = buf.trim().to_lowercase();
+    if answer.is_empty() {
+        return Ok(default_yes);
+    }
+    Ok(matches!(answer.as_str(), "y" | "yes"))
+}
+
+fn prompt_feedback(prompt: &str) -> Result<String> {
+    print!("{prompt}: ");
+    io::stdout().flush()?;
+    let mut buf = String::new();
+    io::stdin().read_line(&mut buf)?;
+    Ok(buf.trim().to_string())
+}
+
+fn pager_print(text: &str, lines_per_page: usize) -> Result<()> {
+    let lines = text.lines().collect::<Vec<_>>();
+    if lines.is_empty() {
+        println!("<empty>");
+        return Ok(());
+    }
+    let mut idx = 0usize;
+    while idx < lines.len() {
+        let end = (idx + lines_per_page).min(lines.len());
+        for line in &lines[idx..end] {
+            println!("{line}");
+        }
+        idx = end;
+        if idx < lines.len() && !prompt_yes_no("Continue artifact preview?", true)? {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn workflow_artifact_text(
+    codex_home: &Path,
+    state: &WorkflowRunState,
+    artifact_ref: &str,
+) -> Option<String> {
+    let record = state.artifacts.get(artifact_ref)?;
+    let path = workflow_artifacts_root(codex_home).join(&record.object_rel_path);
+    std::fs::read_to_string(path).ok()
+}
+
+fn effective_pipeline_components(
+    codex_home: &Path,
+    project_root: Option<&Path>,
+) -> Result<BTreeMap<String, ComponentV2>> {
+    let global_path = scoped_pipelines_json_path(codex_home, project_root, LayerScope::Global)?;
+    let global = read_pipelines_file_any_from_path(global_path.as_path())?.into_v2();
+    let mut components = global.components;
+    if let Some(root) = project_root
+        && repo_trusted(Some(root), codex_home)
+    {
+        let project_path = scoped_pipelines_json_path(codex_home, Some(root), LayerScope::Project)?;
+        let project = read_pipelines_file_any_from_path(project_path.as_path())?.into_v2();
+        for (id, component) in project.components {
+            components.insert(id, component);
+        }
+    }
+    Ok(components)
+}
+
+#[derive(Debug)]
+enum WorkflowActionControl {
+    Result(WorkflowActionResult),
+    Cancelled,
+}
+
+fn pipeline_scope_to_scope(raw: Option<&str>) -> Scope {
+    match raw {
+        Some("global") => Scope::Global,
+        Some("project") => Scope::Project,
+        Some("effective") | None => Scope::Both,
+        Some(_) => Scope::Both,
+    }
+}
+
+fn execute_workflow_action_interactive(
+    codex_home: &Path,
+    project_root: Option<&Path>,
+    action: &WorkflowAction,
+    state: &WorkflowRunState,
+    templates: &[codex_pr_templates::Template],
+    initial_prompt: Option<&str>,
+    model: Option<&str>,
+) -> Result<WorkflowActionControl> {
+    match action {
+        WorkflowAction::InvokeAgent {
+            step_id,
+            template_id,
+            artifact_ref,
+            inputs,
+            feedback,
+            ..
+        } => {
+            let mut raw_prompt = String::new();
+            if let Some(initial_prompt) = initial_prompt {
+                raw_prompt.push_str(initial_prompt.trim());
+                raw_prompt.push_str("\n\n");
+            }
+            if !inputs.is_empty() {
+                raw_prompt.push_str("Inputs:\n");
+                for (k, v) in inputs {
+                    raw_prompt.push_str("- ");
+                    raw_prompt.push_str(k);
+                    raw_prompt.push_str(": ");
+                    raw_prompt.push_str(v);
+                    raw_prompt.push('\n');
+                }
+                raw_prompt.push('\n');
+            }
+            if let Some(previous) = workflow_artifact_text(codex_home, state, artifact_ref) {
+                raw_prompt.push_str("Current artifact content:\n");
+                raw_prompt.push_str(previous.trim());
+                raw_prompt.push_str("\n\n");
+            }
+            if let Some(feedback) = feedback.as_deref() {
+                raw_prompt.push_str("Revision feedback:\n");
+                raw_prompt.push_str(feedback.trim());
+                raw_prompt.push('\n');
+            }
+            if raw_prompt.trim().is_empty() {
+                raw_prompt = format!("Generate artifact for step {step_id}.");
+            }
+
+            let template = find_template_by_id(templates, template_id);
+            let composed_prompt = if let Some(template) = template {
+                codex_pr_templates::compose_prompt(&raw_prompt, template)
+            } else {
+                raw_prompt
+            };
+
+            let mut prompt_hash = Sha256::new();
+            prompt_hash.update(composed_prompt.as_bytes());
+            let prompt_sha256 = to_lower_hex(prompt_hash.finalize().as_ref());
+
+            println!();
+            println!("Step: {step_id}");
+            println!("Action: invoke_agent");
+            println!("Template: {template_id}");
+            println!("Prompt sha256: {prompt_sha256}");
+            if template.is_none() {
+                println!(
+                    "Warning: template {template_id} not found; using raw composed prompt only."
+                );
+            }
+            println!("Prompt preview:");
+            pager_print(composed_prompt.as_str(), 30)?;
+            if !prompt_yes_no("Invoke agent now?", true)? {
+                return Ok(WorkflowActionControl::Cancelled);
+            }
+
+            let request = WorkflowAgentInvokeRequest {
+                prompt: composed_prompt,
+                cwd: project_root
+                    .map(Path::to_path_buf)
+                    .or_else(|| std::env::current_dir().ok()),
+                model: model.map(ToString::to_string),
+            };
+            let content = invoke_workflow_agent(&request)?;
+            Ok(WorkflowActionControl::Result(
+                WorkflowActionResult::AgentOutput { content },
+            ))
+        }
+        WorkflowAction::RequestReview {
+            step_id,
+            artifact_ref,
+            prompt,
+            current_revisions,
+            max_revisions,
+            ..
+        } => {
+            println!();
+            println!("Step: {step_id}");
+            println!("Action: request_review");
+            println!("Artifact: {artifact_ref}");
+            println!("Revision count: {current_revisions}/{max_revisions}");
+            println!("Review prompt: {prompt}");
+            if let Some(content) = workflow_artifact_text(codex_home, state, artifact_ref) {
+                println!();
+                println!("Artifact preview:");
+                pager_print(content.as_str(), 30)?;
+            } else {
+                println!("Artifact content not found in local store for ref: {artifact_ref}");
+            }
+            if prompt_yes_no("Approve this artifact?", false)? {
+                return Ok(WorkflowActionControl::Result(
+                    WorkflowActionResult::ReviewDecision {
+                        approved: true,
+                        feedback: None,
+                    },
+                ));
+            }
+            if prompt_yes_no("Cancel this workflow run?", false)? {
+                return Ok(WorkflowActionControl::Cancelled);
+            }
+            let feedback = prompt_feedback("Enter review feedback")?;
+            Ok(WorkflowActionControl::Result(
+                WorkflowActionResult::ReviewDecision {
+                    approved: false,
+                    feedback: Some(feedback),
+                },
+            ))
+        }
+        WorkflowAction::RunPipeline {
+            step_id,
+            pipeline_id,
+            pipeline_scope,
+            ..
+        } => {
+            println!();
+            println!("Step: {step_id}");
+            println!("Action: run_pipeline");
+            println!(
+                "Pipeline id: {} (scope={})",
+                pipeline_id,
+                pipeline_scope.as_deref().unwrap_or("effective")
+            );
+
+            let scope = pipeline_scope_to_scope(pipeline_scope.as_deref());
+            let merged = merged_pipelines(codex_home, project_root, scope)?;
+            for warning in &merged.warnings {
+                println!("Warning: {warning}");
+            }
+            let Some(entry) = merged.entries.get(pipeline_id) else {
+                return Ok(WorkflowActionControl::Result(
+                    WorkflowActionResult::PipelineOutput {
+                        success: false,
+                        summary: Some(format!("pipeline not found: {pipeline_id}")),
+                    },
+                ));
+            };
+            let components = effective_pipeline_components(codex_home, project_root)?;
+            let expanded = expand_pipeline(&entry.pipeline, &components, ExpandLimits::default())?;
+            println!("Expanded pipeline preview:");
+            println!("{}", serde_json::to_string_pretty(&expanded)?);
+            if prompt_yes_no("Mark pipeline step as successful and continue?", true)? {
+                return Ok(WorkflowActionControl::Result(
+                    WorkflowActionResult::PipelineOutput {
+                        success: true,
+                        summary: Some("approved by interactive workflow runner".to_string()),
+                    },
+                ));
+            }
+            if prompt_yes_no("Cancel this workflow run?", false)? {
+                return Ok(WorkflowActionControl::Cancelled);
+            }
+            let summary = prompt_feedback("Failure summary (optional)")?;
+            Ok(WorkflowActionControl::Result(
+                WorkflowActionResult::PipelineOutput {
+                    success: false,
+                    summary: if summary.trim().is_empty() {
+                        None
+                    } else {
+                        Some(summary)
+                    },
+                },
+            ))
+        }
+        WorkflowAction::Complete { .. } => Ok(WorkflowActionControl::Result(
+            WorkflowActionResult::PipelineOutput {
+                success: true,
+                summary: Some("workflow complete".to_string()),
+            },
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_workflow_command(
+    codex_home: &Path,
+    project_root: Option<PathBuf>,
+    scope: Scope,
+    id: String,
+    run_id: Option<String>,
+    resume: bool,
+    prompt: Option<String>,
+    model: Option<String>,
+    emit_actions_json: bool,
+    action_result_json: Option<String>,
+    max_steps: u32,
+) -> Result<()> {
+    let project_root = require_project_root(project_root, scope)?;
+    let merged = merged_workflows(codex_home, project_root.as_deref(), scope)?;
+    let entry = merged
+        .entries
+        .get(&id)
+        .ok_or_else(|| anyhow::anyhow!("workflow not found: {id}"))?
+        .clone();
+    for warning in &merged.warnings {
+        println!("Warning: {warning}");
+    }
+
+    let cfg = effective_printrevolt_config(codex_home, project_root.as_deref());
+    if !cfg.workflows.enabled {
+        anyhow::bail!(
+            "workflows are disabled in effective config ([printrevolt.workflows].enabled=false)"
+        );
+    }
+
+    let engine = WorkflowEngine::new_with_components(
+        entry.workflow,
+        merged.components,
+        WorkflowEngineLimits {
+            default_max_revisions: cfg.workflows.max_revisions,
+        },
+    )?;
+    let artifact_store = ArtifactStore::new(ArtifactStoreConfig {
+        root: workflow_artifacts_root(codex_home),
+        max_artifact_bytes: cfg.workflows.max_artifact_bytes,
+        max_feedback_bytes: cfg.workflows.max_feedback_bytes,
+    });
+    let templates = discover_templates_for_scope(codex_home, project_root.as_deref(), scope);
+    for warning in &templates.warnings {
+        println!("Warning: {warning}");
+    }
+
+    let effective_run_id = match (run_id, resume) {
+        (Some(run_id), _) => sanitize_run_id(&run_id),
+        (None, true) => find_latest_workflow_run_id(codex_home, Some(&id))
+            .ok_or_else(|| anyhow::anyhow!("no previous run found for workflow id: {id}"))?,
+        (None, false) => generate_run_id(&id),
+    };
+    let state_path = workflow_run_state_path(codex_home, &effective_run_id);
+
+    let mut state = if state_path.exists() {
+        read_run_state(state_path.as_path())?
+    } else if resume {
+        anyhow::bail!(
+            "resume requested but run state file does not exist: {}",
+            state_path.display()
+        );
+    } else {
+        let mut state = engine.start(effective_run_id);
+        state.workflow_id = Some(id.clone());
+        state
+    };
+    if state.workflow_id.is_none() {
+        state.workflow_id = Some(id.clone());
+    }
+    if state.workflow_id.as_deref() != Some(id.as_str()) {
+        anyhow::bail!(
+            "run {} belongs to workflow {:?}, not {}",
+            state.run_id,
+            state.workflow_id,
+            id
+        );
+    }
+
+    if let Some(result_json) = action_result_json.as_deref() {
+        let pending_action = engine.action_for_pending(&state)?.ok_or_else(|| {
+            anyhow::anyhow!("--action-result-json provided but no pending action")
+        })?;
+        let result = action_result_from_json(result_json)?;
+        engine.apply_action_result(&mut state, &pending_action, result, &artifact_store)?;
+        write_run_state(state_path.as_path(), &state)?;
+    }
+
+    let mut steps = 0u32;
+    loop {
+        if steps >= max_steps {
+            anyhow::bail!(
+                "workflow runner exceeded max_steps={} (run_id={})",
+                max_steps,
+                state.run_id
+            );
+        }
+
+        if state.is_terminal() {
+            write_run_state(state_path.as_path(), &state)?;
+            println!(
+                "Workflow run {} ended with status={:?}",
+                state.run_id, state.status
+            );
+            return Ok(());
+        }
+
+        let action = if state.pending.is_some() {
+            engine.action_for_pending(&state)?.ok_or_else(|| {
+                anyhow::anyhow!("run state indicates pending action, but action cannot be rebuilt")
+            })?
+        } else {
+            let Some(next) = engine.next_action(&mut state)? else {
+                write_run_state(state_path.as_path(), &state)?;
+                return Ok(());
+            };
+            next
+        };
+
+        if emit_actions_json {
+            write_run_state(state_path.as_path(), &state)?;
+            println!("{}", action_to_json(&action)?);
+            return Ok(());
+        }
+
+        if matches!(action, WorkflowAction::Complete { .. }) {
+            write_run_state(state_path.as_path(), &state)?;
+            println!("Workflow run {} completed.", state.run_id);
+            return Ok(());
+        }
+
+        let control = execute_workflow_action_interactive(
+            codex_home,
+            project_root.as_deref(),
+            &action,
+            &state,
+            &templates.templates,
+            prompt.as_deref(),
+            model.as_deref(),
+        )?;
+        match control {
+            WorkflowActionControl::Cancelled => {
+                state.pending = None;
+                state.status = WorkflowRunStatus::Failed;
+                state.last_error = Some("cancelled by user".to_string());
+                write_run_state(state_path.as_path(), &state)?;
+                println!("Workflow run {} cancelled.", state.run_id);
+                return Ok(());
+            }
+            WorkflowActionControl::Result(result) => {
+                engine.apply_action_result(&mut state, &action, result, &artifact_store)?;
+                write_run_state(state_path.as_path(), &state)?;
+                steps += 1;
+            }
         }
     }
 }
@@ -1705,11 +2334,13 @@ pub fn run() -> Result<()> {
                             "{}",
                             serde_json::to_string_pretty(&serde_json::json!({
                                 "entry": entry,
+                                "components": merged.components,
                                 "warnings": merged.warnings,
                             }))?
                         );
                     } else {
                         println!("{}", serde_json::to_string_pretty(entry)?);
+                        println!("components={}", merged.components.len());
                         if !merged.warnings.is_empty() {
                             println!();
                             println!("Warnings:");
@@ -1755,13 +2386,61 @@ pub fn run() -> Result<()> {
                     apply,
                 } => {
                     let project_root = discover_project_root(project_root);
+                    let mut components = BTreeMap::new();
+                    components.insert(
+                        "generate_prd_component".to_string(),
+                        WorkflowComponentV1 {
+                            params: BTreeMap::new(),
+                            step: WorkflowStepV1::GenerateArtifact {
+                                template_id: "prd".to_string(),
+                                artifact_kind: "prd".to_string(),
+                                inputs: BTreeMap::new(),
+                                next_step: None,
+                            },
+                        },
+                    );
+                    components.insert(
+                        "revise_prd_component".to_string(),
+                        WorkflowComponentV1 {
+                            params: BTreeMap::new(),
+                            step: WorkflowStepV1::ReviseArtifact {
+                                template_id: "prd_revise".to_string(),
+                                artifact_ref: "prd".to_string(),
+                                feedback_key: "review_prd.feedback".to_string(),
+                                next_step: None,
+                            },
+                        },
+                    );
+                    components.insert(
+                        "generate_ux_component".to_string(),
+                        WorkflowComponentV1 {
+                            params: BTreeMap::new(),
+                            step: WorkflowStepV1::GenerateArtifact {
+                                template_id: "ux_plan".to_string(),
+                                artifact_kind: "ux_plan".to_string(),
+                                inputs: BTreeMap::new(),
+                                next_step: None,
+                            },
+                        },
+                    );
+                    components.insert(
+                        "revise_ux_component".to_string(),
+                        WorkflowComponentV1 {
+                            params: BTreeMap::new(),
+                            step: WorkflowStepV1::ReviseArtifact {
+                                template_id: "ux_plan_revise".to_string(),
+                                artifact_ref: "ux_plan".to_string(),
+                                feedback_key: "review_ux.feedback".to_string(),
+                                next_step: None,
+                            },
+                        },
+                    );
                     let mut steps = BTreeMap::new();
                     steps.insert(
                         "generate_prd".to_string(),
-                        WorkflowStepV1::GenerateArtifact {
-                            template_id: "prd".to_string(),
-                            artifact_kind: "prd".to_string(),
-                            inputs: BTreeMap::new(),
+                        WorkflowStepV1::UseComponent {
+                            component_id: "generate_prd_component".to_string(),
+                            args: BTreeMap::new(),
                             next_step: Some("review_prd".to_string()),
                         },
                     );
@@ -1778,19 +2457,17 @@ pub fn run() -> Result<()> {
                     );
                     steps.insert(
                         "revise_prd".to_string(),
-                        WorkflowStepV1::ReviseArtifact {
-                            template_id: "prd_revise".to_string(),
-                            artifact_ref: "prd".to_string(),
-                            feedback_key: "review_prd.feedback".to_string(),
+                        WorkflowStepV1::UseComponent {
+                            component_id: "revise_prd_component".to_string(),
+                            args: BTreeMap::new(),
                             next_step: Some("review_prd".to_string()),
                         },
                     );
                     steps.insert(
                         "generate_ux".to_string(),
-                        WorkflowStepV1::GenerateArtifact {
-                            template_id: "ux_plan".to_string(),
-                            artifact_kind: "ux_plan".to_string(),
-                            inputs: BTreeMap::new(),
+                        WorkflowStepV1::UseComponent {
+                            component_id: "generate_ux_component".to_string(),
+                            args: BTreeMap::new(),
                             next_step: Some("review_ux".to_string()),
                         },
                     );
@@ -1807,10 +2484,9 @@ pub fn run() -> Result<()> {
                     );
                     steps.insert(
                         "revise_ux".to_string(),
-                        WorkflowStepV1::ReviseArtifact {
-                            template_id: "ux_plan_revise".to_string(),
-                            artifact_ref: "ux_plan".to_string(),
-                            feedback_key: "review_ux.feedback".to_string(),
+                        WorkflowStepV1::UseComponent {
+                            component_id: "revise_ux_component".to_string(),
+                            args: BTreeMap::new(),
                             next_step: Some("review_ux".to_string()),
                         },
                     );
@@ -1827,7 +2503,13 @@ pub fn run() -> Result<()> {
                     };
 
                     if !apply {
-                        println!("{}", serde_json::to_string_pretty(&entry)?);
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "entry": entry,
+                                "components": components,
+                            }))?
+                        );
                         return Ok(());
                     }
 
@@ -1839,6 +2521,9 @@ pub fn run() -> Result<()> {
                     )?;
                     let mut file = read_workflows_file_from_path(path.as_path())?;
                     file.schema_version = "1".to_string();
+                    for (component_id, component) in components {
+                        file.components.insert(component_id, component);
+                    }
                     file.workflows.insert(id, entry);
                     file.validate()
                         .map_err(|err| anyhow::anyhow!("invalid workflows draft: {err}"))?;
@@ -1852,6 +2537,77 @@ pub fn run() -> Result<()> {
                     } else {
                         println!("Updated workflows.json");
                     }
+                }
+                WorkflowsCommand::Run {
+                    project_root,
+                    scope,
+                    id,
+                    run_id,
+                    resume,
+                    prompt,
+                    model,
+                    emit_actions_json,
+                    action_result_json,
+                    max_steps,
+                } => {
+                    let project_root = discover_project_root(project_root);
+                    run_workflow_command(
+                        codex_home.as_path(),
+                        project_root,
+                        scope,
+                        id,
+                        run_id,
+                        resume,
+                        prompt,
+                        model,
+                        emit_actions_json,
+                        action_result_json,
+                        max_steps,
+                    )?;
+                }
+                WorkflowsCommand::Status { run_id, json } => {
+                    let run_id = run_id
+                        .map(|v| sanitize_run_id(&v))
+                        .or_else(|| find_latest_workflow_run_id(codex_home.as_path(), None))
+                        .ok_or_else(|| anyhow::anyhow!("no workflow runs found"))?;
+                    let path = workflow_run_state_path(codex_home.as_path(), run_id.as_str());
+                    if !path.exists() {
+                        anyhow::bail!("run state file not found: {}", path.display());
+                    }
+                    let state = read_run_state(path.as_path())?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&state)?);
+                    } else {
+                        println!("run_id={}", state.run_id);
+                        if let Some(workflow_id) = state.workflow_id.as_deref() {
+                            println!("workflow_id={workflow_id}");
+                        }
+                        println!("status={:?}", state.status);
+                        println!("current_step={}", state.current_step_id);
+                        if let Some(pending) = state.pending.as_ref() {
+                            println!("pending={}", serde_json::to_string(pending)?);
+                        }
+                        if let Some(last_error) = state.last_error.as_deref() {
+                            println!("last_error={last_error}");
+                        }
+                        println!("artifacts={}", state.artifacts.len());
+                    }
+                }
+                WorkflowsCommand::Cancel { run_id } => {
+                    let run_id = run_id
+                        .map(|v| sanitize_run_id(&v))
+                        .or_else(|| find_latest_workflow_run_id(codex_home.as_path(), None))
+                        .ok_or_else(|| anyhow::anyhow!("no workflow runs found"))?;
+                    let path = workflow_run_state_path(codex_home.as_path(), run_id.as_str());
+                    if !path.exists() {
+                        anyhow::bail!("run state file not found: {}", path.display());
+                    }
+                    let mut state = read_run_state(path.as_path())?;
+                    state.pending = None;
+                    state.status = WorkflowRunStatus::Failed;
+                    state.last_error = Some("cancelled by user".to_string());
+                    write_run_state(path.as_path(), &state)?;
+                    println!("Cancelled workflow run {}", state.run_id);
                 }
                 WorkflowsCommand::Restore {
                     project_root,
