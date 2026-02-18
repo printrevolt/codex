@@ -6298,3 +6298,27 @@ async fn review_queues_user_messages_snapshot() {
     .unwrap();
     assert_snapshot!(term.backend().vt100().screen().contents());
 }
+
+#[test]
+fn template_generation_schema_requires_all_declared_properties() {
+    let schema = printrevolt_template_generation_json_schema();
+    let properties = schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+        .expect("schema.properties object");
+    let required = schema
+        .get("required")
+        .and_then(serde_json::Value::as_array)
+        .expect("schema.required array");
+
+    let property_keys: HashSet<&str> = properties.keys().map(String::as_str).collect();
+    let required_keys: HashSet<&str> = required
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+
+    assert_eq!(
+        property_keys, required_keys,
+        "strict JSON schema requires every property key to be listed in required",
+    );
+}

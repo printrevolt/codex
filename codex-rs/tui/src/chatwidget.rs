@@ -934,6 +934,8 @@ fn printrevolt_template_generation_json_schema() -> serde_json::Value {
         },
         "required": [
             "name",
+            "description",
+            "tags",
             "role_objective",
             "procedure",
             "outputs",
