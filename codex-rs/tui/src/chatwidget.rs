@@ -851,6 +851,50 @@ fn yaml_double_quoted(input: &str) -> String {
     format!("\"{escaped}\"")
 }
 
+fn collapse_whitespace(input: &str) -> String {
+    let mut out = String::new();
+    for part in input.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(part);
+    }
+    out
+}
+
+fn truncate_with_ellipsis(input: &str, max_chars: usize) -> String {
+    if input.chars().count() <= max_chars {
+        return input.to_string();
+    }
+    if max_chars <= 1 {
+        return "…".to_string();
+    }
+    let truncated = input.chars().take(max_chars - 1).collect::<String>();
+    format!("{truncated}…")
+}
+
+fn derived_template_description(name: &str) -> String {
+    if name.trim().is_empty() {
+        "A prompt template for consistent, structured agent work.".to_string()
+    } else {
+        format!("A prompt template for {name}.")
+    }
+}
+
+fn coerce_template_name(name: &str) -> String {
+    collapse_whitespace(name).trim().to_string()
+}
+
+fn coerce_template_description(name: &str, description: &str) -> String {
+    let normalized = collapse_whitespace(description).trim().to_string();
+    let derived = if normalized.is_empty() {
+        derived_template_description(name)
+    } else {
+        normalized
+    };
+    truncate_with_ellipsis(derived.trim(), 120)
+}
+
 fn slugify_template_filename(name: &str) -> String {
     let mut out = String::new();
     let mut last_dash = false;
@@ -920,28 +964,26 @@ fn draft_template_contract(
 }
 
 fn printrevolt_template_generation_json_schema() -> serde_json::Value {
+    let properties = serde_json::json!({
+        "name": { "type": "string" },
+        "description": { "type": "string" },
+        "tags": { "type": "array", "items": { "type": "string" } },
+        "role_objective": { "type": "string" },
+        "procedure": { "type": "string" },
+        "outputs": { "type": "string" },
+        "policy_defaults": { "type": "string" },
+        "tooling_scope": { "type": "string" }
+    });
+    // Keep strict-mode `required` synchronized with all declared properties.
+    let required: Vec<String> = properties
+        .as_object()
+        .map(|obj| obj.keys().cloned().collect())
+        .unwrap_or_default();
+
     serde_json::json!({
         "type": "object",
-        "properties": {
-            "name": { "type": "string" },
-            "description": { "type": "string" },
-            "tags": { "type": "array", "items": { "type": "string" } },
-            "role_objective": { "type": "string" },
-            "procedure": { "type": "string" },
-            "outputs": { "type": "string" },
-            "policy_defaults": { "type": "string" },
-            "tooling_scope": { "type": "string" }
-        },
-        "required": [
-            "name",
-            "description",
-            "tags",
-            "role_objective",
-            "procedure",
-            "outputs",
-            "policy_defaults",
-            "tooling_scope"
-        ],
+        "properties": properties,
+        "required": required,
         "additionalProperties": false
     })
 }
@@ -967,13 +1009,16 @@ fn build_printrevolt_template_generation_instruction(
 }
 
 fn render_draft_template_markdown(input: &PrintRevoltTemplateDraftInput) -> String {
+    let name = coerce_template_name(input.name.as_str());
+    let description = coerce_template_description(&name, input.description.as_str());
+
     let mut out = String::new();
     out.push_str("---\n");
     out.push_str("name: ");
-    out.push_str(&yaml_double_quoted(input.name.trim()));
+    out.push_str(&yaml_double_quoted(name.trim()));
     out.push('\n');
     out.push_str("description: ");
-    out.push_str(&yaml_double_quoted(input.description.trim()));
+    out.push_str(&yaml_double_quoted(description.trim()));
     out.push('\n');
     if !input.tags.is_empty() {
         out.push_str("tags:\n");
@@ -4597,13 +4642,16 @@ impl ChatWidget {
             self.add_error_message("Template wizard no longer active.".to_string());
             return;
         };
+
+        let name = coerce_template_name(parsed.name.as_str());
+        let description = coerce_template_description(&name, parsed.description.as_str());
         wizard.input = PrintRevoltTemplateDraftInput {
-            name: parsed.name.trim().to_string(),
-            description: parsed.description.trim().to_string(),
+            name,
+            description,
             tags: parsed
                 .tags
                 .into_iter()
-                .map(|t| t.trim().to_string())
+                .map(|t| collapse_whitespace(&t).trim().to_string())
                 .filter(|t| !t.is_empty())
                 .collect(),
             role_objective: parsed.role_objective.trim().to_string(),
@@ -5807,6 +5855,7 @@ impl ChatWidget {
                     raw_prompt.as_str(),
                     template_name.as_str(),
                     &contract,
+                    &[],
                 ),
             ),
         };
@@ -7037,6 +7086,7 @@ impl ChatWidget {
                 workflows.insert(
                     "main".to_string(),
                     codex_pr_pipelines::Workflow {
+                        profile_refs: Default::default(),
                         parts,
                         finally_workflow: None,
                     },
@@ -7846,6 +7896,9 @@ impl ChatWidget {
                 message,
                 codex_error_info,
             }) => {
+                if !from_replay && self.printrevolt_pending_template_generation.is_some() {
+                    self.abort_printrevolt_template_generation(message.clone());
+                }
                 if let Some(info) = codex_error_info
                     && let Some(kind) = rate_limit_error_kind(&info)
                 {
@@ -7927,7 +7980,17 @@ impl ChatWidget {
                 message,
                 additional_details,
                 ..
-            }) => self.on_stream_error(message, additional_details),
+            }) => {
+                if !from_replay && self.printrevolt_pending_template_generation.is_some() {
+                    let reason = if additional_details.trim().is_empty() {
+                        message.clone()
+                    } else {
+                        format!("{message}\n{additional_details}")
+                    };
+                    self.abort_printrevolt_template_generation(reason);
+                }
+                self.on_stream_error(message, additional_details)
+            }
             EventMsg::UserMessage(ev) => {
                 if from_replay {
                     self.on_user_message_event(ev);
