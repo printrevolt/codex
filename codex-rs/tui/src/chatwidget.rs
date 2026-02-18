@@ -6071,6 +6071,14 @@ impl ChatWidget {
             SlashCommand::Model => {
                 self.open_model_popup();
             }
+            SlashCommand::Provider => {
+                self.add_info_message(
+                    "`/provider` is not implemented in this build yet.".to_string(),
+                    Some("For now, set `model_provider` in config and restart.".to_string()),
+                );
+                self.bottom_pane.drain_pending_submission_state();
+                self.request_redraw();
+            }
             SlashCommand::Personality => {
                 self.open_personality_popup();
             }
