@@ -68,6 +68,7 @@ members = [
     "crates/pr_types",
     "crates/pr_audit",
     "crates/pr_policy",
+    "crates/pr_profiles",
     "crates/pr_hooks",
     "crates/pr_pipelines",
     "crates/pr_repo_ops",

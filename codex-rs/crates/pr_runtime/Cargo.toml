@@ -22,6 +22,7 @@ codex-pr-audit = { path = "../pr_audit" }
 codex-pr-config = { path = "../pr_config" }
 codex-pr-hooks = { path = "../pr_hooks" }
 codex-pr-policy = { path = "../pr_policy" }
+codex-pr-profiles = { path = "../pr_profiles" }
 codex-pr-templates = { path = "../pr_templates" }
 codex-pr-types = { path = "../pr_types" }
 serde_json = { workspace = true }

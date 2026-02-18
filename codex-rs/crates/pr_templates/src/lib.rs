@@ -29,6 +29,8 @@ pub struct TemplateRef {
 pub struct TemplateDefaults {
     #[serde(default)]
     pub policy: PolicyDefaults,
+    #[serde(default)]
+    pub profile_refs: codex_pr_types::ProfileRefs,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -189,18 +191,44 @@ pub fn clamp_policy_defaults(
 }
 
 pub fn compose_prompt(raw_prompt: &str, template: &Template) -> String {
-    compose_prompt_from_contract(raw_prompt, template.name.as_str(), &template.contract)
+    compose_prompt_with_guidelines(raw_prompt, template, &[])
+}
+
+pub fn compose_prompt_with_guidelines(
+    raw_prompt: &str,
+    template: &Template,
+    guidelines: &[String],
+) -> String {
+    compose_prompt_from_contract(
+        raw_prompt,
+        template.name.as_str(),
+        &template.contract,
+        guidelines,
+    )
 }
 
 pub fn compose_prompt_from_contract(
     raw_prompt: &str,
     template_name: &str,
     contract: &TemplateContract,
+    guidelines: &[String],
 ) -> String {
     let mut out = String::new();
     out.push_str("[TEMPLATE: ");
     out.push_str(template_name);
     out.push_str("]\n\n");
+
+    if !guidelines.is_empty() {
+        out.push_str("Guidelines:\n");
+        for guideline in guidelines {
+            if !guideline.trim().is_empty() {
+                out.push_str("- ");
+                out.push_str(guideline.trim());
+                out.push('\n');
+            }
+        }
+        out.push('\n');
+    }
 
     out.push_str("Role + Objective:\n");
     out.push_str(contract.role_objective.trim());
@@ -437,7 +465,7 @@ No network.
             policy_defaults: "Tighten policy.".to_string(),
             tooling_scope: "No network.".to_string(),
         };
-        let out = compose_prompt_from_contract("Fix tests", "Security Reviewer", &contract);
+        let out = compose_prompt_from_contract("Fix tests", "Security Reviewer", &contract, &[]);
         assert!(out.contains("[TEMPLATE: Security Reviewer]"));
         assert!(out.contains("Role + Objective:\nBe strict."));
         assert!(out.contains("User request:\nFix tests"));

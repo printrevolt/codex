@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use codex_pr_types::ChildProcessPolicy;
 use codex_pr_types::CommandSpecV1;
+use codex_pr_types::ProfileRefs;
 use codex_pr_types::ToolCall;
 use codex_pr_types::ToolInput;
 use codex_pr_types::ToolKind;
@@ -165,11 +166,15 @@ pub struct ParamSpecV2 {
 pub struct ComponentV2 {
     #[serde(default)]
     pub params: BTreeMap<String, ParamSpecV2>,
+    #[serde(default)]
+    pub profile_refs: ProfileRefs,
     pub parts: Vec<Part>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Workflow {
+    #[serde(default)]
+    pub profile_refs: ProfileRefs,
     pub parts: Vec<Part>,
     #[serde(default)]
     pub finally_workflow: Option<WorkflowId>,
@@ -187,7 +192,22 @@ pub struct PipelineEntryV2 {
     pub name: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default)]
+    pub profile_refs: ProfileRefs,
     pub pipeline: Pipeline,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct PipelineProfileAttachmentsV1 {
+    /// pipeline_id -> profile refs
+    pub pipelines: BTreeMap<String, ProfileRefs>,
+    /// pipeline_id.workflow_id -> profile refs
+    pub workflows: BTreeMap<String, ProfileRefs>,
+    /// pipeline_id.workflow_id.part_index -> profile refs
+    pub parts: BTreeMap<String, ProfileRefs>,
+    /// component_id -> profile refs
+    pub components: BTreeMap<String, ProfileRefs>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -197,6 +217,8 @@ pub struct PipelineBundleV2 {
     pub components: BTreeMap<ComponentId, ComponentV2>,
     #[serde(default)]
     pub pipelines: BTreeMap<String, PipelineEntryV2>,
+    #[serde(default)]
+    pub profile_attachments: PipelineProfileAttachmentsV1,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -404,6 +426,7 @@ pub fn expand_pipeline(
         workflows.insert(
             workflow_id.clone(),
             Workflow {
+                profile_refs: workflow.profile_refs.clone(),
                 parts: expand_parts(
                     workflow.parts.as_slice(),
                     components,
@@ -1510,6 +1533,7 @@ mod tests {
         workflows.insert(
             "cleanup".to_string(),
             Workflow {
+                profile_refs: ProfileRefs::default(),
                 parts: vec![Part::SetVar {
                     key: "cleanup".to_string(),
                     value: "1".to_string(),
@@ -1520,6 +1544,7 @@ mod tests {
         workflows.insert(
             "main".to_string(),
             Workflow {
+                profile_refs: ProfileRefs::default(),
                 parts: vec![
                     Part::Defer {
                         part: Box::new(Part::SetVar {
@@ -1564,6 +1589,7 @@ mod tests {
         workflows.insert(
             "main".to_string(),
             Workflow {
+                profile_refs: ProfileRefs::default(),
                 parts: vec![
                     Part::RunTool {
                         tool_call: ToolCall {
@@ -1640,6 +1666,7 @@ mod tests {
         workflows.insert(
             "main".to_string(),
             Workflow {
+                profile_refs: ProfileRefs::default(),
                 parts: vec![
                     Part::RequireApproval {
                         scope: ApprovalScope::OneOff,
@@ -1695,6 +1722,7 @@ mod tests {
         workflows.insert(
             "main".to_string(),
             Workflow {
+                profile_refs: ProfileRefs::default(),
                 parts: vec![Part::RunCommand {
                     cwd: None,
                     argv: None,
@@ -1754,6 +1782,7 @@ mod tests {
         workflows.insert(
             "main".to_string(),
             Workflow {
+                profile_refs: ProfileRefs::default(),
                 parts: vec![Part::EnsureWorktree {
                     worktree_root: "/tmp/worktrees".to_string(),
                     naming: "prcc/${session_id}".to_string(),

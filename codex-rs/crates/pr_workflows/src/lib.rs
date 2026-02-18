@@ -498,6 +498,7 @@ impl WorkflowEngine {
                 artifact_kind,
                 inputs,
                 next_step,
+                ..
             } => {
                 state.status = WorkflowRunStatus::Waiting;
                 state.pending = Some(PendingAction::InvokeAgent {
@@ -548,6 +549,7 @@ impl WorkflowEngine {
                 artifact_ref,
                 feedback_key,
                 next_step,
+                ..
             } => {
                 let feedback = state
                     .feedback
@@ -575,6 +577,7 @@ impl WorkflowEngine {
                 pipeline_id,
                 pipeline_scope,
                 next_step,
+                ..
             } => {
                 state.status = WorkflowRunStatus::Waiting;
                 state.pending = Some(PendingAction::RunPipeline {
@@ -829,6 +832,7 @@ fn validate_graph(
             id: "_validation".to_string(),
             name: "Validation".to_string(),
             enabled: true,
+            profile_refs: codex_pr_types::ProfileRefs::default(),
             workflow: graph.clone(),
         },
     );
@@ -836,6 +840,7 @@ fn validate_graph(
         schema_version: WORKFLOWS_SCHEMA_VERSION.to_string(),
         components: components.clone(),
         workflows,
+        profile_attachments: codex_pr_types::WorkflowProfileAttachmentsV1::default(),
     };
     file.validate().map_err(WorkflowError::Validation)
 }
@@ -907,6 +912,7 @@ mod tests {
                 artifact_kind: "prd".to_string(),
                 inputs: BTreeMap::new(),
                 next_step: Some("review_prd".to_string()),
+                profile_refs: codex_pr_types::ProfileRefs::default(),
             },
         );
         steps.insert(
@@ -918,6 +924,7 @@ mod tests {
                 on_feedback: "revise_prd".to_string(),
                 max_revisions,
                 revision_counter_key: "review_prd".to_string(),
+                profile_refs: codex_pr_types::ProfileRefs::default(),
             },
         );
         steps.insert(
@@ -927,6 +934,7 @@ mod tests {
                 artifact_ref: "prd".to_string(),
                 feedback_key: "review_prd.feedback".to_string(),
                 next_step: Some("review_prd".to_string()),
+                profile_refs: codex_pr_types::ProfileRefs::default(),
             },
         );
         steps.insert("complete".to_string(), WorkflowStepV1::Complete);
@@ -949,6 +957,7 @@ mod tests {
                 id: "flow".to_string(),
                 name: "Flow".to_string(),
                 enabled: false,
+                profile_refs: codex_pr_types::ProfileRefs::default(),
                 workflow: simple_graph(3),
             },
         );

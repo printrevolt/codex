@@ -2140,6 +2140,7 @@ dependencies = [
  "codex-pr-advisor",
  "codex-pr-config",
  "codex-pr-pipelines",
+ "codex-pr-profiles",
  "codex-pr-repo-ops",
  "codex-pr-runtime",
  "codex-pr-templates",
@@ -2149,6 +2150,7 @@ dependencies = [
  "codex-utils-home-dir",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha2",
  "toml 0.9.11+spec-1.1.0",
 ]
@@ -2220,6 +2222,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-pr-profiles"
+version = "0.101.0"
+dependencies = [
+ "codex-pr-types",
+ "lru 0.16.3",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "codex-pr-repo-ops"
 version = "0.101.0"
 dependencies = [
@@ -2243,6 +2259,7 @@ dependencies = [
  "codex-pr-config",
  "codex-pr-hooks",
  "codex-pr-policy",
+ "codex-pr-profiles",
  "codex-pr-templates",
  "codex-pr-types",
  "codex-protocol",

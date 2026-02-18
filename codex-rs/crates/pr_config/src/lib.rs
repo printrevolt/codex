@@ -347,6 +347,11 @@ fn default_printrevolt_table() -> TomlValue {
         TomlValue::Table(toml::map::Map::new()),
     );
     root.insert("vars".to_string(), TomlValue::Table(toml::map::Map::new()));
+    root.insert("policy_profiles".to_string(), TomlValue::Array(Vec::new()));
+    root.insert(
+        "guideline_profiles".to_string(),
+        TomlValue::Array(Vec::new()),
+    );
     TomlValue::Table(root)
 }
 

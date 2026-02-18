@@ -194,6 +194,13 @@ pub struct AgentConfig {
     pub templates: TemplatesUiOverrides,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ProfileRefs {
+    pub policy_profiles: Vec<String>,
+    pub guideline_profiles: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LifecycleEventKind {
@@ -317,6 +324,64 @@ impl Default for VerifyPolicy {
             required: false,
             max_age_ms: 30 * 60 * 1000,
             command_prefixes: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct PolicyProfilePatchV1 {
+    pub enabled: Option<bool>,
+    pub deny_dangerous_always: Option<bool>,
+    pub verify_required: Option<bool>,
+    pub verify_max_age_ms: Option<u64>,
+    pub verify_command_prefixes_add: Vec<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct PolicyProfileV1 {
+    pub description: Option<String>,
+    pub includes: Vec<String>,
+    pub patch: PolicyProfilePatchV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct GuidelineProfileV1 {
+    pub description: Option<String>,
+    pub includes: Vec<String>,
+    pub instructions: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PolicyProfilesFileV1 {
+    pub schema_version: String,
+    pub profiles: BTreeMap<String, PolicyProfileV1>,
+}
+
+impl Default for PolicyProfilesFileV1 {
+    fn default() -> Self {
+        Self {
+            schema_version: "1".to_string(),
+            profiles: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GuidelineProfilesFileV1 {
+    pub schema_version: String,
+    pub profiles: BTreeMap<String, GuidelineProfileV1>,
+}
+
+impl Default for GuidelineProfilesFileV1 {
+    fn default() -> Self {
+        Self {
+            schema_version: "1".to_string(),
+            profiles: BTreeMap::new(),
         }
     }
 }
@@ -498,6 +563,8 @@ pub struct WorkflowParamSpecV1 {
 pub struct WorkflowComponentV1 {
     #[serde(default)]
     pub params: BTreeMap<String, WorkflowParamSpecV1>,
+    #[serde(default)]
+    pub profile_refs: ProfileRefs,
     pub step: WorkflowStepV1,
 }
 
@@ -507,6 +574,8 @@ pub struct WorkflowEntryV1 {
     pub name: String,
     #[serde(default = "default_enabled_true")]
     pub enabled: bool,
+    #[serde(default)]
+    pub profile_refs: ProfileRefs,
     pub workflow: WorkflowGraphV1,
 }
 
@@ -520,6 +589,8 @@ pub enum WorkflowStepV1 {
         inputs: BTreeMap<String, String>,
         #[serde(default)]
         next_step: Option<String>,
+        #[serde(default)]
+        profile_refs: ProfileRefs,
     },
     ReviewArtifact {
         artifact_ref: String,
@@ -531,6 +602,8 @@ pub enum WorkflowStepV1 {
         max_revisions: u32,
         #[serde(default)]
         revision_counter_key: String,
+        #[serde(default)]
+        profile_refs: ProfileRefs,
     },
     ReviseArtifact {
         template_id: String,
@@ -538,6 +611,8 @@ pub enum WorkflowStepV1 {
         feedback_key: String,
         #[serde(default)]
         next_step: Option<String>,
+        #[serde(default)]
+        profile_refs: ProfileRefs,
     },
     RunPipeline {
         pipeline_id: String,
@@ -545,6 +620,8 @@ pub enum WorkflowStepV1 {
         pipeline_scope: Option<String>,
         #[serde(default)]
         next_step: Option<String>,
+        #[serde(default)]
+        profile_refs: ProfileRefs,
     },
     UseComponent {
         component_id: String,
@@ -552,12 +629,25 @@ pub enum WorkflowStepV1 {
         args: BTreeMap<String, String>,
         #[serde(default)]
         next_step: Option<String>,
+        #[serde(default)]
+        profile_refs: ProfileRefs,
     },
     Complete,
 }
 
 fn default_max_revisions() -> u32 {
     3
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct WorkflowProfileAttachmentsV1 {
+    /// workflow_id -> profile refs
+    pub workflows: BTreeMap<String, ProfileRefs>,
+    /// workflow_id.step_id -> profile refs
+    pub steps: BTreeMap<String, ProfileRefs>,
+    /// component_id -> profile refs
+    pub components: BTreeMap<String, ProfileRefs>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -567,6 +657,8 @@ pub struct WorkflowsFileV1 {
     pub components: BTreeMap<String, WorkflowComponentV1>,
     #[serde(default)]
     pub workflows: BTreeMap<String, WorkflowEntryV1>,
+    #[serde(default)]
+    pub profile_attachments: WorkflowProfileAttachmentsV1,
 }
 
 impl Default for WorkflowsFileV1 {
@@ -575,6 +667,7 @@ impl Default for WorkflowsFileV1 {
             schema_version: "1".to_string(),
             components: BTreeMap::new(),
             workflows: BTreeMap::new(),
+            profile_attachments: WorkflowProfileAttachmentsV1::default(),
         }
     }
 }
@@ -605,6 +698,42 @@ impl WorkflowsFileV1 {
                         "component {component_id} step kind is not reusable (expected generate_artifact, revise_artifact, or run_pipeline)"
                     ));
                 }
+            }
+        }
+        for workflow_id in self.profile_attachments.workflows.keys() {
+            if !self.workflows.contains_key(workflow_id) {
+                return Err(format!(
+                    "workflow profile attachment references missing workflow {}",
+                    workflow_id
+                ));
+            }
+        }
+        for component_id in self.profile_attachments.components.keys() {
+            if !self.components.contains_key(component_id) {
+                return Err(format!(
+                    "workflow profile attachment references missing component {}",
+                    component_id
+                ));
+            }
+        }
+        for step_ref in self.profile_attachments.steps.keys() {
+            let Some((workflow_id, step_id)) = step_ref.split_once('.') else {
+                return Err(format!(
+                    "workflow step profile attachment key must be workflow_id.step_id: {}",
+                    step_ref
+                ));
+            };
+            let Some(workflow) = self.workflows.get(workflow_id) else {
+                return Err(format!(
+                    "workflow step profile attachment references missing workflow {}",
+                    workflow_id
+                ));
+            };
+            if !workflow.workflow.steps.contains_key(step_id) {
+                return Err(format!(
+                    "workflow step profile attachment references missing step {} in workflow {}",
+                    step_id, workflow_id
+                ));
             }
         }
         for (workflow_key, workflow) in &self.workflows {
@@ -731,6 +860,7 @@ impl WorkflowsFileV1 {
     pub fn merge_effective(global: Option<Self>, repo: Option<Self>) -> Result<Self, String> {
         let mut components = BTreeMap::<String, WorkflowComponentV1>::new();
         let mut workflows = BTreeMap::<String, WorkflowEntryV1>::new();
+        let mut attachments = WorkflowProfileAttachmentsV1::default();
         if let Some(global) = global {
             global.validate()?;
             for (id, component) in global.components {
@@ -739,6 +869,13 @@ impl WorkflowsFileV1 {
             for (id, workflow) in global.workflows {
                 workflows.insert(id, workflow);
             }
+            attachments
+                .workflows
+                .extend(global.profile_attachments.workflows);
+            attachments.steps.extend(global.profile_attachments.steps);
+            attachments
+                .components
+                .extend(global.profile_attachments.components);
         }
         if let Some(repo) = repo {
             repo.validate()?;
@@ -748,11 +885,19 @@ impl WorkflowsFileV1 {
             for (id, workflow) in repo.workflows {
                 workflows.insert(id, workflow);
             }
+            attachments
+                .workflows
+                .extend(repo.profile_attachments.workflows);
+            attachments.steps.extend(repo.profile_attachments.steps);
+            attachments
+                .components
+                .extend(repo.profile_attachments.components);
         }
         Ok(Self {
             schema_version: "1".to_string(),
             components,
             workflows,
+            profile_attachments: attachments,
         })
     }
 }
@@ -815,6 +960,10 @@ pub struct PrintRevoltConfig {
     pub agents: BTreeMap<String, AgentConfig>,
     #[serde(default)]
     pub vars: BTreeMap<String, String>,
+    #[serde(default)]
+    pub policy_profiles: Vec<String>,
+    #[serde(default)]
+    pub guideline_profiles: Vec<String>,
 }
 
 impl Default for PrintRevoltConfig {
@@ -830,6 +979,8 @@ impl Default for PrintRevoltConfig {
             ui: UiConfig::default(),
             agents: BTreeMap::new(),
             vars: BTreeMap::new(),
+            policy_profiles: Vec::new(),
+            guideline_profiles: Vec::new(),
         }
     }
 }

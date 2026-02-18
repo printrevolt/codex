@@ -20,12 +20,22 @@ use codex_pr_pipelines::ExpandLimits;
 use codex_pr_pipelines::Pipeline;
 use codex_pr_pipelines::PipelineEntryV2;
 use codex_pr_pipelines::expand_pipeline;
+use codex_pr_profiles::LoadedProfilesRegistry;
+use codex_pr_profiles::ProfileScope;
+use codex_pr_profiles::ProfilesResolverCache;
+use codex_pr_profiles::benchmark_resolver_warm_path;
+use codex_pr_profiles::load_profiles_registry;
+use codex_pr_profiles::resolve_subject_profiles;
+use codex_pr_profiles::resolve_subject_profiles_cached;
 use codex_pr_repo_ops::BranchEnsureArgs;
 use codex_pr_repo_ops::RepoOpPlan;
 use codex_pr_repo_ops::WorktreeEnsureArgs;
 use codex_pr_runtime::WorkflowAgentInvokeRequest;
 use codex_pr_runtime::invoke_workflow_agent;
+use codex_pr_types::GuidelineProfilesFileV1;
+use codex_pr_types::PolicyProfilesFileV1;
 use codex_pr_types::PrintRevoltConfig;
+use codex_pr_types::ProfileRefs;
 use codex_pr_types::WorkflowComponentV1;
 use codex_pr_types::WorkflowEntryV1;
 use codex_pr_types::WorkflowGraphV1;
@@ -125,6 +135,12 @@ enum Command {
     Policy {
         #[command(subcommand)]
         command: PolicyCommand,
+    },
+
+    /// Profile registry, resolution, and attachment helpers.
+    Profiles {
+        #[command(subcommand)]
+        command: ProfilesCommand,
     },
 
     /// Pipeline discovery and generation helpers.
@@ -376,6 +392,222 @@ enum PolicyCommand {
 
         /// Config write scope.
         #[arg(long, value_enum, default_value = "global")]
+        scope: Scope,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ProfileKind {
+    Policy,
+    Guideline,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ProfileMode {
+    Merge,
+    Replace,
+}
+
+#[derive(Debug, Subcommand)]
+enum ProfilesCommand {
+    /// List profile ids in the effective global/project registry view.
+    List {
+        /// Override project root (defaults to searching upward from cwd for .git).
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+
+        /// Registry scope.
+        #[arg(long, value_enum, default_value = "both")]
+        scope: Scope,
+
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Show one profile definition by id.
+    Show {
+        /// Override project root (defaults to searching upward from cwd for .git).
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+
+        /// Registry scope.
+        #[arg(long, value_enum, default_value = "both")]
+        scope: Scope,
+
+        /// Profile kind.
+        #[arg(long, value_enum)]
+        kind: ProfileKind,
+
+        /// Profile id.
+        #[arg(long)]
+        id: String,
+
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Validate registry files and include graphs.
+    Validate {
+        /// Override project root (defaults to searching upward from cwd for .git).
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+
+        /// Registry scope.
+        #[arg(long, value_enum, default_value = "both")]
+        scope: Scope,
+
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Draft a starter profile into policy_profiles.json or guideline_profiles.json.
+    Draft {
+        /// Override project root (defaults to searching upward from cwd for .git).
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+
+        /// Write scope for registry updates.
+        #[arg(long, value_enum, default_value = "global")]
+        scope: Scope,
+
+        /// Profile kind.
+        #[arg(long, value_enum)]
+        kind: ProfileKind,
+
+        /// Profile id to create.
+        #[arg(long)]
+        id: String,
+
+        /// Optional description.
+        #[arg(long)]
+        description: Option<String>,
+
+        /// Apply by writing to the registry file (otherwise preview JSON).
+        #[arg(long)]
+        apply: bool,
+    },
+
+    /// Resolve effective policy/guidelines from refs + registry + floor.
+    Resolve {
+        /// Override project root (defaults to searching upward from cwd for .git).
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+
+        /// Registry/config scope.
+        #[arg(long, value_enum, default_value = "both")]
+        scope: Scope,
+
+        /// Policy profile ids (repeatable).
+        #[arg(long = "policy-profile")]
+        policy_profiles: Vec<String>,
+
+        /// Guideline profile ids (repeatable).
+        #[arg(long = "guideline-profile")]
+        guideline_profiles: Vec<String>,
+
+        /// Use cache + print warm-path perf stats.
+        #[arg(long)]
+        perf: bool,
+
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Explain resolved profile provenance and warnings in operator-friendly text.
+    Explain {
+        /// Override project root (defaults to searching upward from cwd for .git).
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+
+        /// Registry/config scope.
+        #[arg(long, value_enum, default_value = "both")]
+        scope: Scope,
+
+        /// Policy profile ids (repeatable).
+        #[arg(long = "policy-profile")]
+        policy_profiles: Vec<String>,
+
+        /// Guideline profile ids (repeatable).
+        #[arg(long = "guideline-profile")]
+        guideline_profiles: Vec<String>,
+
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Attach a profile to a template/pipeline/workflow subject.
+    Attach {
+        /// Override project root (defaults to searching upward from cwd for .git).
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+
+        /// Write scope for attachment mutation.
+        #[arg(long, value_enum, default_value = "global")]
+        scope: Scope,
+
+        /// Subject key.
+        /// template:<template_id> |
+        /// pipeline:<pipeline_id> |
+        /// pipeline_workflow:<pipeline_id>.<workflow_id> |
+        /// pipeline_part:<pipeline_id>.<workflow_id>.<part_index> |
+        /// pipeline_component:<component_id> |
+        /// workflow:<workflow_id> |
+        /// workflow_step:<workflow_id>.<step_id> |
+        /// workflow_component:<component_id>
+        #[arg(long)]
+        subject: String,
+
+        /// Profile kind.
+        #[arg(long, value_enum)]
+        kind: ProfileKind,
+
+        /// Profile id to attach.
+        #[arg(long)]
+        profile_id: String,
+
+        /// Merge appends if missing; replace overwrites the subject list for this kind.
+        #[arg(long, value_enum, default_value = "merge")]
+        mode: ProfileMode,
+    },
+
+    /// Detach a profile from a template/pipeline/workflow subject.
+    Detach {
+        /// Override project root (defaults to searching upward from cwd for .git).
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+
+        /// Write scope for attachment mutation.
+        #[arg(long, value_enum, default_value = "global")]
+        scope: Scope,
+
+        /// Subject key (same format as `attach --subject`).
+        #[arg(long)]
+        subject: String,
+
+        /// Profile kind.
+        #[arg(long, value_enum)]
+        kind: ProfileKind,
+
+        /// Profile id to detach.
+        #[arg(long)]
+        profile_id: String,
+    },
+
+    /// Interactive helper for command-center/TUI style profile flows.
+    Interactive {
+        /// Override project root (defaults to searching upward from cwd for .git).
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+
+        /// Registry/config scope.
+        #[arg(long, value_enum, default_value = "both")]
         scope: Scope,
     },
 }
@@ -797,6 +1029,8 @@ struct PipelinesFileV2 {
     components: BTreeMap<String, ComponentV2>,
     #[serde(default)]
     pipelines: BTreeMap<String, PipelineEntryV2>,
+    #[serde(default)]
+    profile_attachments: codex_pr_pipelines::PipelineProfileAttachmentsV1,
 }
 
 #[derive(Debug, Clone)]
@@ -810,6 +1044,7 @@ struct PipelineResolvedEntryV1 {
     id: String,
     name: String,
     enabled: bool,
+    profile_refs: ProfileRefs,
     source: LayerScope,
     pipeline: Pipeline,
 }
@@ -819,6 +1054,7 @@ struct WorkflowResolvedEntryV1 {
     id: String,
     name: String,
     enabled: bool,
+    profile_refs: ProfileRefs,
     source: LayerScope,
     workflow: WorkflowGraphV1,
 }
@@ -966,6 +1202,7 @@ fn read_pipelines_file_any_from_path(path: &Path) -> Result<PipelinesFile> {
             schema_version: "2".to_string(),
             components: BTreeMap::new(),
             pipelines: BTreeMap::new(),
+            profile_attachments: codex_pr_pipelines::PipelineProfileAttachmentsV1::default(),
         }));
     }
     let raw = std::fs::read_to_string(path)?;
@@ -1004,11 +1241,13 @@ impl PipelinesFile {
                                 id: v.id,
                                 name: v.name,
                                 enabled: v.enabled,
+                                profile_refs: codex_pr_types::ProfileRefs::default(),
                                 pipeline: v.pipeline,
                             },
                         )
                     })
                     .collect(),
+                profile_attachments: codex_pr_pipelines::PipelineProfileAttachmentsV1::default(),
             },
         }
     }
@@ -1050,6 +1289,7 @@ fn merged_workflows(
                     id: entry.id,
                     name: entry.name,
                     enabled: entry.enabled,
+                    profile_refs: entry.profile_refs,
                     source: LayerScope::Global,
                     workflow: entry.workflow,
                 },
@@ -1077,6 +1317,7 @@ fn merged_workflows(
                         id: entry.id,
                         name: entry.name,
                         enabled: entry.enabled,
+                        profile_refs: entry.profile_refs,
                         source: LayerScope::Project,
                         workflow: entry.workflow,
                     },
@@ -1120,6 +1361,7 @@ fn merged_pipelines(
                     id: entry.id,
                     name: entry.name,
                     enabled: entry.enabled,
+                    profile_refs: entry.profile_refs,
                     source: LayerScope::Global,
                     pipeline: entry.pipeline,
                 },
@@ -1147,6 +1389,7 @@ fn merged_pipelines(
                         id: entry.id,
                         name: entry.name,
                         enabled: entry.enabled,
+                        profile_refs: entry.profile_refs,
                         source: LayerScope::Project,
                         pipeline: entry.pipeline,
                     },
@@ -1164,6 +1407,610 @@ fn merged_pipelines(
 struct MergedPipelines {
     entries: BTreeMap<String, PipelineResolvedEntryV1>,
     warnings: Vec<String>,
+}
+
+fn scoped_policy_profiles_json_path(
+    codex_home: &Path,
+    project_root: Option<&Path>,
+    scope: LayerScope,
+) -> Result<PathBuf> {
+    match scope {
+        LayerScope::Global => Ok(codex_pr_profiles::global_policy_profiles_path(codex_home)),
+        LayerScope::Project => {
+            let Some(project_root) = project_root else {
+                anyhow::bail!(
+                    "project scope selected but no project root detected; pass --project-root"
+                );
+            };
+            Ok(codex_pr_profiles::project_policy_profiles_path(
+                project_root,
+            ))
+        }
+    }
+}
+
+fn scoped_guideline_profiles_json_path(
+    codex_home: &Path,
+    project_root: Option<&Path>,
+    scope: LayerScope,
+) -> Result<PathBuf> {
+    match scope {
+        LayerScope::Global => Ok(codex_pr_profiles::global_guideline_profiles_path(
+            codex_home,
+        )),
+        LayerScope::Project => {
+            let Some(project_root) = project_root else {
+                anyhow::bail!(
+                    "project scope selected but no project root detected; pass --project-root"
+                );
+            };
+            Ok(codex_pr_profiles::project_guideline_profiles_path(
+                project_root,
+            ))
+        }
+    }
+}
+
+fn read_policy_profiles_file_from_path(path: &Path) -> Result<PolicyProfilesFileV1> {
+    if !path.exists() {
+        return Ok(PolicyProfilesFileV1::default());
+    }
+    let raw = std::fs::read_to_string(path)?;
+    let parsed = serde_json::from_str::<PolicyProfilesFileV1>(&raw).map_err(|err| {
+        anyhow::anyhow!("invalid policy_profiles.json ({}): {err}", path.display())
+    })?;
+    if parsed.schema_version != "1" {
+        anyhow::bail!(
+            "unknown policy_profiles.json schema_version: {} (expected 1)",
+            parsed.schema_version
+        );
+    }
+    Ok(parsed)
+}
+
+fn read_guideline_profiles_file_from_path(path: &Path) -> Result<GuidelineProfilesFileV1> {
+    if !path.exists() {
+        return Ok(GuidelineProfilesFileV1::default());
+    }
+    let raw = std::fs::read_to_string(path)?;
+    let parsed = serde_json::from_str::<GuidelineProfilesFileV1>(&raw).map_err(|err| {
+        anyhow::anyhow!(
+            "invalid guideline_profiles.json ({}): {err}",
+            path.display()
+        )
+    })?;
+    if parsed.schema_version != "1" {
+        anyhow::bail!(
+            "unknown guideline_profiles.json schema_version: {} (expected 1)",
+            parsed.schema_version
+        );
+    }
+    Ok(parsed)
+}
+
+fn write_policy_profiles_file_with_backup(
+    codex_home: &Path,
+    path: &Path,
+    file: &PolicyProfilesFileV1,
+) -> Result<Option<PathBuf>> {
+    let backup = backup_file_if_present(path, codex_home, "policy_profiles");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let encoded = serde_json::to_string_pretty(file)?;
+    std::fs::write(path, encoded)?;
+    Ok(backup)
+}
+
+fn write_guideline_profiles_file_with_backup(
+    codex_home: &Path,
+    path: &Path,
+    file: &GuidelineProfilesFileV1,
+) -> Result<Option<PathBuf>> {
+    let backup = backup_file_if_present(path, codex_home, "guideline_profiles");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let encoded = serde_json::to_string_pretty(file)?;
+    std::fs::write(path, encoded)?;
+    Ok(backup)
+}
+
+fn filter_registry_for_scope(registry: &mut LoadedProfilesRegistry, scope: Scope) {
+    match scope {
+        Scope::Both => {}
+        Scope::Global => {
+            registry
+                .policy_profiles
+                .retain(|id, _| registry.policy_scope.get(id) == Some(&ProfileScope::Global));
+            registry
+                .guideline_profiles
+                .retain(|id, _| registry.guideline_scope.get(id) == Some(&ProfileScope::Global));
+        }
+        Scope::Project => {
+            registry
+                .policy_profiles
+                .retain(|id, _| registry.policy_scope.get(id) == Some(&ProfileScope::Project));
+            registry
+                .guideline_profiles
+                .retain(|id, _| registry.guideline_scope.get(id) == Some(&ProfileScope::Project));
+        }
+    }
+}
+
+fn load_registry_for_scope(
+    codex_home: &Path,
+    project_root: Option<&Path>,
+    scope: Scope,
+) -> Result<LoadedProfilesRegistry> {
+    let project_root = match scope {
+        Scope::Global => None,
+        Scope::Project | Scope::Both => project_root,
+    };
+    let trusted = repo_trusted(project_root, codex_home);
+    let mut registry = load_profiles_registry(codex_home, project_root, trusted)
+        .map_err(|err| anyhow::anyhow!("failed to load profile registries: {err}"))?;
+    filter_registry_for_scope(&mut registry, scope);
+    Ok(registry)
+}
+
+fn global_printrevolt_config(codex_home: &Path, project_root: Option<&Path>) -> PrintRevoltConfig {
+    let resolved = resolve_printrevolt_config_scoped(
+        codex_home,
+        project_root,
+        None,
+        ConfigResolveScope::Global,
+    );
+    let cfg_toml = toml::to_string(&resolved.printrevolt).unwrap_or_default();
+    toml::from_str::<PrintRevoltConfig>(&cfg_toml).unwrap_or_default()
+}
+
+fn resolved_profiles_for_scope(
+    codex_home: &Path,
+    project_root: Option<&Path>,
+    scope: Scope,
+    policy_profiles: Vec<String>,
+    guideline_profiles: Vec<String>,
+    use_cache: bool,
+) -> Result<serde_json::Value> {
+    let project_root = require_project_root(project_root.map(Path::to_path_buf), scope)?;
+    let project_root_ref = project_root.as_deref();
+    let cfg = match scope {
+        Scope::Global => global_printrevolt_config(codex_home, project_root_ref),
+        Scope::Project | Scope::Both => effective_printrevolt_config(codex_home, project_root_ref),
+    };
+    let floor = global_printrevolt_config(codex_home, project_root_ref).policy;
+    let refs = ProfileRefs {
+        policy_profiles: if policy_profiles.is_empty() {
+            cfg.policy_profiles.clone()
+        } else {
+            policy_profiles
+        },
+        guideline_profiles: if guideline_profiles.is_empty() {
+            cfg.guideline_profiles.clone()
+        } else {
+            guideline_profiles
+        },
+    };
+    let registry = load_registry_for_scope(codex_home, project_root_ref, scope)?;
+    let resolved = if use_cache {
+        let cache = ProfilesResolverCache::new(512);
+        resolve_subject_profiles_cached(&cache, &registry, &refs, &cfg.policy, &floor)
+    } else {
+        resolve_subject_profiles(&registry, &refs, &cfg.policy, &floor)
+    };
+    let perf = if use_cache {
+        let cache = ProfilesResolverCache::new(512);
+        Some(benchmark_resolver_warm_path(
+            &cache,
+            &registry,
+            &refs,
+            &cfg.policy,
+            &floor,
+            200,
+        ))
+    } else {
+        None
+    };
+
+    Ok(serde_json::json!({
+        "scope": scope.as_str(),
+        "requested_refs": refs,
+        "resolved": resolved,
+        "perf": perf,
+    }))
+}
+
+fn apply_profile_ref_attach(
+    refs: &mut ProfileRefs,
+    kind: ProfileKind,
+    profile_id: &str,
+    mode: ProfileMode,
+) {
+    let target = match kind {
+        ProfileKind::Policy => &mut refs.policy_profiles,
+        ProfileKind::Guideline => &mut refs.guideline_profiles,
+    };
+    match mode {
+        ProfileMode::Merge => {
+            if !target.iter().any(|v| v == profile_id) {
+                target.push(profile_id.to_string());
+            }
+        }
+        ProfileMode::Replace => {
+            target.clear();
+            target.push(profile_id.to_string());
+        }
+    }
+}
+
+fn apply_profile_ref_detach(refs: &mut ProfileRefs, kind: ProfileKind, profile_id: &str) {
+    let target = match kind {
+        ProfileKind::Policy => &mut refs.policy_profiles,
+        ProfileKind::Guideline => &mut refs.guideline_profiles,
+    };
+    target.retain(|v| v != profile_id);
+}
+
+enum ProfileSubject {
+    Template {
+        template_id: String,
+    },
+    Pipeline {
+        pipeline_id: String,
+    },
+    PipelineWorkflow {
+        pipeline_id: String,
+        workflow_id: String,
+    },
+    PipelinePart {
+        pipeline_id: String,
+        workflow_id: String,
+        part_index: usize,
+    },
+    PipelineComponent {
+        component_id: String,
+    },
+    Workflow {
+        workflow_id: String,
+    },
+    WorkflowStep {
+        workflow_id: String,
+        step_id: String,
+    },
+    WorkflowComponent {
+        component_id: String,
+    },
+}
+
+fn parse_profile_subject(raw: &str) -> Result<ProfileSubject> {
+    if let Some(id) = raw.strip_prefix("template:") {
+        if id.trim().is_empty() {
+            anyhow::bail!("template subject requires id: template:<template_id>");
+        }
+        return Ok(ProfileSubject::Template {
+            template_id: id.to_string(),
+        });
+    }
+    if let Some(id) = raw.strip_prefix("pipeline:") {
+        return Ok(ProfileSubject::Pipeline {
+            pipeline_id: id.to_string(),
+        });
+    }
+    if let Some(rest) = raw.strip_prefix("pipeline_workflow:") {
+        let Some((pipeline_id, workflow_id)) = rest.split_once('.') else {
+            anyhow::bail!(
+                "pipeline_workflow subject must be pipeline_workflow:<pipeline_id>.<workflow_id>"
+            );
+        };
+        return Ok(ProfileSubject::PipelineWorkflow {
+            pipeline_id: pipeline_id.to_string(),
+            workflow_id: workflow_id.to_string(),
+        });
+    }
+    if let Some(rest) = raw.strip_prefix("pipeline_part:") {
+        let mut it = rest.split('.');
+        let pipeline_id = it
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("missing pipeline_id"))?;
+        let workflow_id = it
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("missing workflow_id"))?;
+        let part_index = it
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("missing part_index"))?
+            .parse::<usize>()
+            .map_err(|err| anyhow::anyhow!("invalid part_index: {err}"))?;
+        return Ok(ProfileSubject::PipelinePart {
+            pipeline_id: pipeline_id.to_string(),
+            workflow_id: workflow_id.to_string(),
+            part_index,
+        });
+    }
+    if let Some(id) = raw.strip_prefix("pipeline_component:") {
+        return Ok(ProfileSubject::PipelineComponent {
+            component_id: id.to_string(),
+        });
+    }
+    if let Some(id) = raw.strip_prefix("workflow:") {
+        return Ok(ProfileSubject::Workflow {
+            workflow_id: id.to_string(),
+        });
+    }
+    if let Some(rest) = raw.strip_prefix("workflow_step:") {
+        let Some((workflow_id, step_id)) = rest.split_once('.') else {
+            anyhow::bail!("workflow_step subject must be workflow_step:<workflow_id>.<step_id>");
+        };
+        return Ok(ProfileSubject::WorkflowStep {
+            workflow_id: workflow_id.to_string(),
+            step_id: step_id.to_string(),
+        });
+    }
+    if let Some(id) = raw.strip_prefix("workflow_component:") {
+        return Ok(ProfileSubject::WorkflowComponent {
+            component_id: id.to_string(),
+        });
+    }
+    anyhow::bail!("invalid subject format: {raw}");
+}
+
+fn mutate_template_frontmatter_profile_refs(
+    path: &Path,
+    kind: ProfileKind,
+    profile_id: &str,
+    mode: ProfileMode,
+    detach: bool,
+) -> Result<()> {
+    let raw = std::fs::read_to_string(path)?;
+    let mut lines = raw.lines();
+    let Some(first) = lines.next() else {
+        anyhow::bail!("template is empty: {}", path.display());
+    };
+    if first.trim() != "---" {
+        anyhow::bail!(
+            "template missing YAML frontmatter start marker (---): {}",
+            path.display()
+        );
+    }
+
+    let mut frontmatter_len = first.len() + 1;
+    let mut frontmatter_end = None;
+    for line in raw[first.len() + 1..].lines() {
+        if line.trim() == "---" {
+            frontmatter_end = Some(frontmatter_len - 1);
+            frontmatter_len += line.len() + 1;
+            break;
+        }
+        frontmatter_len += line.len() + 1;
+    }
+    let Some(end_idx) = frontmatter_end else {
+        anyhow::bail!(
+            "template missing YAML frontmatter end marker: {}",
+            path.display()
+        );
+    };
+    let frontmatter_raw = &raw[first.len() + 1..end_idx];
+    let body_start = frontmatter_len;
+    let body = if body_start <= raw.len() {
+        &raw[body_start..]
+    } else {
+        ""
+    };
+
+    let mut frontmatter: serde_yaml::Value = serde_yaml::from_str(frontmatter_raw)
+        .map_err(|err| anyhow::anyhow!("invalid template frontmatter {}: {err}", path.display()))?;
+    let root = frontmatter
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow::anyhow!("template frontmatter root is not a map"))?;
+    let defaults_key = serde_yaml::Value::String("defaults".to_string());
+    if !root.contains_key(&defaults_key) {
+        root.insert(
+            defaults_key.clone(),
+            serde_yaml::Value::Mapping(Default::default()),
+        );
+    }
+    let defaults = root
+        .get_mut(&defaults_key)
+        .and_then(serde_yaml::Value::as_mapping_mut)
+        .ok_or_else(|| anyhow::anyhow!("template defaults is not a map"))?;
+
+    let refs_key = serde_yaml::Value::String("profile_refs".to_string());
+    if !defaults.contains_key(&refs_key) {
+        defaults.insert(
+            refs_key.clone(),
+            serde_yaml::Value::Mapping(Default::default()),
+        );
+    }
+    let refs_map = defaults
+        .get_mut(&refs_key)
+        .and_then(serde_yaml::Value::as_mapping_mut)
+        .ok_or_else(|| anyhow::anyhow!("template defaults.profile_refs is not a map"))?;
+
+    let field_name = match kind {
+        ProfileKind::Policy => "policy_profiles",
+        ProfileKind::Guideline => "guideline_profiles",
+    };
+    let field_key = serde_yaml::Value::String(field_name.to_string());
+    if !refs_map.contains_key(&field_key) {
+        refs_map.insert(field_key.clone(), serde_yaml::Value::Sequence(Vec::new()));
+    }
+    let values = refs_map
+        .get_mut(&field_key)
+        .and_then(serde_yaml::Value::as_sequence_mut)
+        .ok_or_else(|| {
+            anyhow::anyhow!("template defaults.profile_refs.{field_name} is not a list")
+        })?;
+
+    if detach {
+        values.retain(|v| v.as_str() != Some(profile_id));
+    } else {
+        match mode {
+            ProfileMode::Merge => {
+                if !values.iter().any(|v| v.as_str() == Some(profile_id)) {
+                    values.push(serde_yaml::Value::String(profile_id.to_string()));
+                }
+            }
+            ProfileMode::Replace => {
+                values.clear();
+                values.push(serde_yaml::Value::String(profile_id.to_string()));
+            }
+        }
+    }
+
+    let mut out = String::new();
+    out.push_str("---\n");
+    out.push_str(&serde_yaml::to_string(&frontmatter)?);
+    out.push_str("---\n");
+    out.push_str(body);
+    std::fs::write(path, out)?;
+    Ok(())
+}
+
+fn resolve_template_attachment_target(
+    codex_home: &Path,
+    project_root: Option<&Path>,
+    scope: LayerScope,
+    template_id: &str,
+) -> Result<PathBuf> {
+    let discovery_scope = match scope {
+        LayerScope::Global => Scope::Global,
+        LayerScope::Project => Scope::Project,
+    };
+    let discovered = discover_templates_for_scope(codex_home, project_root, discovery_scope);
+    let Some(template) = find_template_by_id(&discovered.templates, template_id) else {
+        anyhow::bail!("template not found for subject: {}", template_id);
+    };
+    let Some(path) = template.path.as_ref() else {
+        anyhow::bail!("template does not have a writable path: {}", template_id);
+    };
+    Ok(path.clone())
+}
+
+fn mutate_pipelines_attachment(
+    file: &mut PipelinesFileV2,
+    subject: &ProfileSubject,
+    kind: ProfileKind,
+    profile_id: &str,
+    mode: ProfileMode,
+    detach: bool,
+) -> Result<()> {
+    match subject {
+        ProfileSubject::Pipeline { pipeline_id } => {
+            let entry = file
+                .pipelines
+                .get_mut(pipeline_id)
+                .ok_or_else(|| anyhow::anyhow!("pipeline not found: {pipeline_id}"))?;
+            if detach {
+                apply_profile_ref_detach(&mut entry.profile_refs, kind, profile_id);
+            } else {
+                apply_profile_ref_attach(&mut entry.profile_refs, kind, profile_id, mode);
+            }
+        }
+        ProfileSubject::PipelineWorkflow {
+            pipeline_id,
+            workflow_id,
+        } => {
+            let key = format!("{pipeline_id}.{workflow_id}");
+            let refs = file.profile_attachments.workflows.entry(key).or_default();
+            if detach {
+                apply_profile_ref_detach(refs, kind, profile_id);
+            } else {
+                apply_profile_ref_attach(refs, kind, profile_id, mode);
+            }
+        }
+        ProfileSubject::PipelinePart {
+            pipeline_id,
+            workflow_id,
+            part_index,
+        } => {
+            let key = format!("{pipeline_id}.{workflow_id}.{part_index}");
+            let refs = file.profile_attachments.parts.entry(key).or_default();
+            if detach {
+                apply_profile_ref_detach(refs, kind, profile_id);
+            } else {
+                apply_profile_ref_attach(refs, kind, profile_id, mode);
+            }
+        }
+        ProfileSubject::PipelineComponent { component_id } => {
+            if let Some(component) = file.components.get_mut(component_id) {
+                if detach {
+                    apply_profile_ref_detach(&mut component.profile_refs, kind, profile_id);
+                } else {
+                    apply_profile_ref_attach(&mut component.profile_refs, kind, profile_id, mode);
+                }
+            } else {
+                let refs = file
+                    .profile_attachments
+                    .components
+                    .entry(component_id.clone())
+                    .or_default();
+                if detach {
+                    apply_profile_ref_detach(refs, kind, profile_id);
+                } else {
+                    apply_profile_ref_attach(refs, kind, profile_id, mode);
+                }
+            }
+        }
+        _ => anyhow::bail!("subject is not a pipeline subject"),
+    }
+    Ok(())
+}
+
+fn mutate_workflows_attachment(
+    file: &mut codex_pr_types::WorkflowsFileV1,
+    subject: &ProfileSubject,
+    kind: ProfileKind,
+    profile_id: &str,
+    mode: ProfileMode,
+    detach: bool,
+) -> Result<()> {
+    match subject {
+        ProfileSubject::Workflow { workflow_id } => {
+            let entry = file
+                .workflows
+                .get_mut(workflow_id)
+                .ok_or_else(|| anyhow::anyhow!("workflow not found: {workflow_id}"))?;
+            if detach {
+                apply_profile_ref_detach(&mut entry.profile_refs, kind, profile_id);
+            } else {
+                apply_profile_ref_attach(&mut entry.profile_refs, kind, profile_id, mode);
+            }
+        }
+        ProfileSubject::WorkflowStep {
+            workflow_id,
+            step_id,
+        } => {
+            let key = format!("{workflow_id}.{step_id}");
+            let refs = file.profile_attachments.steps.entry(key).or_default();
+            if detach {
+                apply_profile_ref_detach(refs, kind, profile_id);
+            } else {
+                apply_profile_ref_attach(refs, kind, profile_id, mode);
+            }
+        }
+        ProfileSubject::WorkflowComponent { component_id } => {
+            if let Some(component) = file.components.get_mut(component_id) {
+                if detach {
+                    apply_profile_ref_detach(&mut component.profile_refs, kind, profile_id);
+                } else {
+                    apply_profile_ref_attach(&mut component.profile_refs, kind, profile_id, mode);
+                }
+            } else {
+                let refs = file
+                    .profile_attachments
+                    .components
+                    .entry(component_id.clone())
+                    .or_default();
+                if detach {
+                    apply_profile_ref_detach(refs, kind, profile_id);
+                } else {
+                    apply_profile_ref_attach(refs, kind, profile_id, mode);
+                }
+            }
+        }
+        _ => anyhow::bail!("subject is not a workflow subject"),
+    }
+    Ok(())
 }
 
 fn discover_templates_for_scope(
@@ -1403,6 +2250,7 @@ fn execute_workflow_action_interactive(
     action: &WorkflowAction,
     state: &WorkflowRunState,
     templates: &[codex_pr_templates::Template],
+    guideline_instructions: &[String],
     initial_prompt: Option<&str>,
     model: Option<&str>,
 ) -> Result<WorkflowActionControl> {
@@ -1447,7 +2295,11 @@ fn execute_workflow_action_interactive(
 
             let template = find_template_by_id(templates, template_id);
             let composed_prompt = if let Some(template) = template {
-                codex_pr_templates::compose_prompt(&raw_prompt, template)
+                codex_pr_templates::compose_prompt_with_guidelines(
+                    &raw_prompt,
+                    template,
+                    guideline_instructions,
+                )
             } else {
                 raw_prompt
             };
@@ -1497,7 +2349,15 @@ fn execute_workflow_action_interactive(
             println!("Action: request_review");
             println!("Artifact: {artifact_ref}");
             println!("Revision count: {current_revisions}/{max_revisions}");
-            println!("Review prompt: {prompt}");
+            if guideline_instructions.is_empty() {
+                println!("Review prompt: {prompt}");
+            } else {
+                println!("Review prompt: {prompt}");
+                println!("Guidelines:");
+                for g in guideline_instructions {
+                    println!("- {}", g.trim());
+                }
+            }
             if let Some(content) = workflow_artifact_text(codex_home, state, artifact_ref) {
                 println!();
                 println!("Artifact preview:");
@@ -1619,6 +2479,15 @@ fn run_workflow_command(
             "workflows are disabled in effective config ([printrevolt.workflows].enabled=false)"
         );
     }
+    let floor_cfg = global_printrevolt_config(codex_home, project_root.as_deref());
+    let registry = load_registry_for_scope(codex_home, project_root.as_deref(), scope)?;
+    let workflow_refs = ProfileRefs {
+        policy_profiles: cfg.policy_profiles.clone(),
+        guideline_profiles: cfg.guideline_profiles.clone(),
+    };
+    let resolved_profile_ctx =
+        resolve_subject_profiles(&registry, &workflow_refs, &cfg.policy, &floor_cfg.policy);
+    let workflow_guidelines = resolved_profile_ctx.guidelines;
 
     let engine = WorkflowEngine::new_with_components(
         entry.workflow,
@@ -1727,6 +2596,7 @@ fn run_workflow_command(
             &action,
             &state,
             &templates.templates,
+            workflow_guidelines.as_slice(),
             prompt.as_deref(),
             model.as_deref(),
         )?;
@@ -1998,6 +2868,601 @@ pub fn run() -> Result<()> {
             }
         }
 
+        Command::Profiles { command } => {
+            let codex_home = find_codex_home()?;
+            match command {
+                ProfilesCommand::List {
+                    project_root,
+                    scope,
+                    json,
+                } => {
+                    let project_root =
+                        require_project_root(discover_project_root(project_root), scope)?;
+                    let registry = load_registry_for_scope(
+                        codex_home.as_path(),
+                        project_root.as_deref(),
+                        scope,
+                    )?;
+                    let mut policy = registry.policy_profiles.keys().cloned().collect::<Vec<_>>();
+                    policy.sort();
+                    let mut guideline = registry
+                        .guideline_profiles
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    guideline.sort();
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "scope": scope,
+                                "policy_profiles": policy,
+                                "guideline_profiles": guideline,
+                                "warnings": registry.warnings,
+                            }))?
+                        );
+                    } else {
+                        println!("scope={}", scope.as_str());
+                        println!("policy_profiles={}", policy.len());
+                        for id in policy {
+                            println!("- {id}");
+                        }
+                        println!("guideline_profiles={}", guideline.len());
+                        for id in guideline {
+                            println!("- {id}");
+                        }
+                        if !registry.warnings.is_empty() {
+                            println!();
+                            println!("Warnings:");
+                            for w in registry.warnings {
+                                println!("- {w}");
+                            }
+                        }
+                    }
+                }
+                ProfilesCommand::Show {
+                    project_root,
+                    scope,
+                    kind,
+                    id,
+                    json,
+                } => {
+                    let project_root =
+                        require_project_root(discover_project_root(project_root), scope)?;
+                    let registry = load_registry_for_scope(
+                        codex_home.as_path(),
+                        project_root.as_deref(),
+                        scope,
+                    )?;
+                    let payload = match kind {
+                        ProfileKind::Policy => {
+                            let profile = registry
+                                .policy_profiles
+                                .get(&id)
+                                .ok_or_else(|| anyhow::anyhow!("policy profile not found: {id}"))?;
+                            serde_json::json!({
+                                "kind": "policy",
+                                "id": id,
+                                "scope": registry.policy_scope.get(&id),
+                                "profile": profile,
+                            })
+                        }
+                        ProfileKind::Guideline => {
+                            let profile =
+                                registry.guideline_profiles.get(&id).ok_or_else(|| {
+                                    anyhow::anyhow!("guideline profile not found: {id}")
+                                })?;
+                            serde_json::json!({
+                                "kind": "guideline",
+                                "id": id,
+                                "scope": registry.guideline_scope.get(&id),
+                                "profile": profile,
+                            })
+                        }
+                    };
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&payload)?);
+                    } else {
+                        println!("{}", serde_json::to_string_pretty(&payload)?);
+                        for w in registry.warnings {
+                            println!("Warning: {w}");
+                        }
+                    }
+                }
+                ProfilesCommand::Validate {
+                    project_root,
+                    scope,
+                    json,
+                } => {
+                    let project_root =
+                        require_project_root(discover_project_root(project_root), scope)?;
+                    let registry = load_registry_for_scope(
+                        codex_home.as_path(),
+                        project_root.as_deref(),
+                        scope,
+                    )?;
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "ok": true,
+                                "scope": scope,
+                                "policy_profiles": registry.policy_profiles.len(),
+                                "guideline_profiles": registry.guideline_profiles.len(),
+                                "warnings": registry.warnings,
+                            }))?
+                        );
+                    } else {
+                        println!(
+                            "Validated registries (scope={}): policy_profiles={} guideline_profiles={}",
+                            scope.as_str(),
+                            registry.policy_profiles.len(),
+                            registry.guideline_profiles.len()
+                        );
+                        for w in registry.warnings {
+                            println!("Warning: {w}");
+                        }
+                    }
+                }
+                ProfilesCommand::Draft {
+                    project_root,
+                    scope,
+                    kind,
+                    id,
+                    description,
+                    apply,
+                } => {
+                    let project_root = discover_project_root(project_root);
+                    let writable_scope = ensure_writable_scope(scope, "--scope")?;
+                    match kind {
+                        ProfileKind::Policy => {
+                            let path = scoped_policy_profiles_json_path(
+                                codex_home.as_path(),
+                                project_root.as_deref(),
+                                writable_scope,
+                            )?;
+                            let mut file = read_policy_profiles_file_from_path(path.as_path())?;
+                            let draft = codex_pr_types::PolicyProfileV1 {
+                                description,
+                                includes: Vec::new(),
+                                patch: codex_pr_types::PolicyProfilePatchV1::default(),
+                            };
+                            if !apply {
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&serde_json::json!({
+                                        "path": path,
+                                        "id": id,
+                                        "profile": draft,
+                                    }))?
+                                );
+                                return Ok(());
+                            }
+                            file.profiles.insert(id, draft);
+                            let backup = write_policy_profiles_file_with_backup(
+                                codex_home.as_path(),
+                                path.as_path(),
+                                &file,
+                            )?;
+                            if let Some(backup) = backup {
+                                println!(
+                                    "Updated policy_profiles.json (backup: {})",
+                                    backup.display()
+                                );
+                            } else {
+                                println!("Updated policy_profiles.json");
+                            }
+                        }
+                        ProfileKind::Guideline => {
+                            let path = scoped_guideline_profiles_json_path(
+                                codex_home.as_path(),
+                                project_root.as_deref(),
+                                writable_scope,
+                            )?;
+                            let mut file = read_guideline_profiles_file_from_path(path.as_path())?;
+                            let draft = codex_pr_types::GuidelineProfileV1 {
+                                description,
+                                includes: Vec::new(),
+                                instructions: vec![
+                                    "Be explicit about assumptions and tradeoffs.".to_string(),
+                                ],
+                            };
+                            if !apply {
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&serde_json::json!({
+                                        "path": path,
+                                        "id": id,
+                                        "profile": draft,
+                                    }))?
+                                );
+                                return Ok(());
+                            }
+                            file.profiles.insert(id, draft);
+                            let backup = write_guideline_profiles_file_with_backup(
+                                codex_home.as_path(),
+                                path.as_path(),
+                                &file,
+                            )?;
+                            if let Some(backup) = backup {
+                                println!(
+                                    "Updated guideline_profiles.json (backup: {})",
+                                    backup.display()
+                                );
+                            } else {
+                                println!("Updated guideline_profiles.json");
+                            }
+                        }
+                    }
+                }
+                ProfilesCommand::Resolve {
+                    project_root,
+                    scope,
+                    policy_profiles,
+                    guideline_profiles,
+                    perf,
+                    json,
+                } => {
+                    let project_root =
+                        require_project_root(discover_project_root(project_root), scope)?;
+                    let payload = resolved_profiles_for_scope(
+                        codex_home.as_path(),
+                        project_root.as_deref(),
+                        scope,
+                        policy_profiles,
+                        guideline_profiles,
+                        perf,
+                    )?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&payload)?);
+                    } else {
+                        println!("{}", serde_json::to_string_pretty(&payload)?);
+                    }
+                }
+                ProfilesCommand::Explain {
+                    project_root,
+                    scope,
+                    policy_profiles,
+                    guideline_profiles,
+                    json,
+                } => {
+                    let project_root =
+                        require_project_root(discover_project_root(project_root), scope)?;
+                    let payload = resolved_profiles_for_scope(
+                        codex_home.as_path(),
+                        project_root.as_deref(),
+                        scope,
+                        policy_profiles,
+                        guideline_profiles,
+                        false,
+                    )?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&payload)?);
+                    } else {
+                        let resolved = payload
+                            .get("resolved")
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!({}));
+                        let fingerprint = resolved
+                            .get("fingerprint_sha256")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("<none>");
+                        println!("fingerprint={fingerprint}");
+                        println!(
+                            "provenance={}",
+                            resolved
+                                .get("provenance")
+                                .and_then(|v| v.as_array())
+                                .map(|v| v.len())
+                                .unwrap_or(0)
+                        );
+                        if let Some(provenance) =
+                            resolved.get("provenance").and_then(|v| v.as_array())
+                        {
+                            for entry in provenance {
+                                let profile_type = entry
+                                    .get("profile_type")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown");
+                                let profile_id = entry
+                                    .get("profile_id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown");
+                                let scope = entry
+                                    .get("scope")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown");
+                                println!("- {profile_type}:{profile_id} ({scope})");
+                            }
+                        }
+                        if let Some(warnings) = resolved.get("warnings").and_then(|v| v.as_array())
+                            && !warnings.is_empty()
+                        {
+                            println!("Warnings:");
+                            for warning in warnings {
+                                println!("- {}", warning.as_str().unwrap_or_default());
+                            }
+                        }
+                    }
+                }
+                ProfilesCommand::Attach {
+                    project_root,
+                    scope,
+                    subject,
+                    kind,
+                    profile_id,
+                    mode,
+                } => {
+                    let project_root = discover_project_root(project_root);
+                    let writable_scope = ensure_writable_scope(scope, "--scope")?;
+                    let parsed_subject = parse_profile_subject(subject.as_str())?;
+                    let registry = load_registry_for_scope(
+                        codex_home.as_path(),
+                        project_root.as_deref(),
+                        Scope::Both,
+                    )?;
+                    let exists = match kind {
+                        ProfileKind::Policy => registry.policy_profiles.contains_key(&profile_id),
+                        ProfileKind::Guideline => {
+                            registry.guideline_profiles.contains_key(&profile_id)
+                        }
+                    };
+                    if !exists {
+                        anyhow::bail!("profile id not found in effective registry: {profile_id}");
+                    }
+
+                    match parsed_subject {
+                        ProfileSubject::Template { template_id } => {
+                            let template_path = resolve_template_attachment_target(
+                                codex_home.as_path(),
+                                project_root.as_deref(),
+                                writable_scope,
+                                template_id.as_str(),
+                            )?;
+                            let backup = backup_file_if_present(
+                                template_path.as_path(),
+                                codex_home.as_path(),
+                                "templates",
+                            );
+                            mutate_template_frontmatter_profile_refs(
+                                template_path.as_path(),
+                                kind,
+                                profile_id.as_str(),
+                                mode,
+                                false,
+                            )?;
+                            if let Some(backup) = backup {
+                                println!(
+                                    "Updated template attachment (backup: {})",
+                                    backup.display()
+                                );
+                            } else {
+                                println!("Updated template attachment");
+                            }
+                        }
+                        ProfileSubject::Pipeline { .. }
+                        | ProfileSubject::PipelineWorkflow { .. }
+                        | ProfileSubject::PipelinePart { .. }
+                        | ProfileSubject::PipelineComponent { .. } => {
+                            let path = scoped_pipelines_json_path(
+                                codex_home.as_path(),
+                                project_root.as_deref(),
+                                writable_scope,
+                            )?;
+                            let mut file =
+                                read_pipelines_file_any_from_path(path.as_path())?.into_v2();
+                            mutate_pipelines_attachment(
+                                &mut file,
+                                &parsed_subject,
+                                kind,
+                                profile_id.as_str(),
+                                mode,
+                                false,
+                            )?;
+                            let backup =
+                                write_pipelines_file(codex_home.as_path(), path.as_path(), &file)?;
+                            if let Some(backup) = backup {
+                                println!(
+                                    "Updated pipelines.json attachments (backup: {})",
+                                    backup.display()
+                                );
+                            } else {
+                                println!("Updated pipelines.json attachments");
+                            }
+                        }
+                        ProfileSubject::Workflow { .. }
+                        | ProfileSubject::WorkflowStep { .. }
+                        | ProfileSubject::WorkflowComponent { .. } => {
+                            let path = scoped_workflows_json_path(
+                                codex_home.as_path(),
+                                project_root.as_deref(),
+                                writable_scope,
+                            )?;
+                            let mut file = read_workflows_file_from_path(path.as_path())?;
+                            mutate_workflows_attachment(
+                                &mut file,
+                                &parsed_subject,
+                                kind,
+                                profile_id.as_str(),
+                                mode,
+                                false,
+                            )?;
+                            file.validate().map_err(|err| {
+                                anyhow::anyhow!("invalid workflows file after attachment: {err}")
+                            })?;
+                            let backup = write_workflows_file_with_backup(
+                                codex_home.as_path(),
+                                path.as_path(),
+                                &file,
+                            )?;
+                            if let Some(backup) = backup {
+                                println!(
+                                    "Updated workflows.json attachments (backup: {})",
+                                    backup.display()
+                                );
+                            } else {
+                                println!("Updated workflows.json attachments");
+                            }
+                        }
+                    }
+                }
+                ProfilesCommand::Detach {
+                    project_root,
+                    scope,
+                    subject,
+                    kind,
+                    profile_id,
+                } => {
+                    let project_root = discover_project_root(project_root);
+                    let writable_scope = ensure_writable_scope(scope, "--scope")?;
+                    let parsed_subject = parse_profile_subject(subject.as_str())?;
+                    match parsed_subject {
+                        ProfileSubject::Template { template_id } => {
+                            let template_path = resolve_template_attachment_target(
+                                codex_home.as_path(),
+                                project_root.as_deref(),
+                                writable_scope,
+                                template_id.as_str(),
+                            )?;
+                            let backup = backup_file_if_present(
+                                template_path.as_path(),
+                                codex_home.as_path(),
+                                "templates",
+                            );
+                            mutate_template_frontmatter_profile_refs(
+                                template_path.as_path(),
+                                kind,
+                                profile_id.as_str(),
+                                ProfileMode::Merge,
+                                true,
+                            )?;
+                            if let Some(backup) = backup {
+                                println!(
+                                    "Updated template attachment (backup: {})",
+                                    backup.display()
+                                );
+                            } else {
+                                println!("Updated template attachment");
+                            }
+                        }
+                        ProfileSubject::Pipeline { .. }
+                        | ProfileSubject::PipelineWorkflow { .. }
+                        | ProfileSubject::PipelinePart { .. }
+                        | ProfileSubject::PipelineComponent { .. } => {
+                            let path = scoped_pipelines_json_path(
+                                codex_home.as_path(),
+                                project_root.as_deref(),
+                                writable_scope,
+                            )?;
+                            let mut file =
+                                read_pipelines_file_any_from_path(path.as_path())?.into_v2();
+                            mutate_pipelines_attachment(
+                                &mut file,
+                                &parsed_subject,
+                                kind,
+                                profile_id.as_str(),
+                                ProfileMode::Merge,
+                                true,
+                            )?;
+                            let backup =
+                                write_pipelines_file(codex_home.as_path(), path.as_path(), &file)?;
+                            if let Some(backup) = backup {
+                                println!(
+                                    "Updated pipelines.json attachments (backup: {})",
+                                    backup.display()
+                                );
+                            } else {
+                                println!("Updated pipelines.json attachments");
+                            }
+                        }
+                        ProfileSubject::Workflow { .. }
+                        | ProfileSubject::WorkflowStep { .. }
+                        | ProfileSubject::WorkflowComponent { .. } => {
+                            let path = scoped_workflows_json_path(
+                                codex_home.as_path(),
+                                project_root.as_deref(),
+                                writable_scope,
+                            )?;
+                            let mut file = read_workflows_file_from_path(path.as_path())?;
+                            mutate_workflows_attachment(
+                                &mut file,
+                                &parsed_subject,
+                                kind,
+                                profile_id.as_str(),
+                                ProfileMode::Merge,
+                                true,
+                            )?;
+                            file.validate().map_err(|err| {
+                                anyhow::anyhow!("invalid workflows file after detach: {err}")
+                            })?;
+                            let backup = write_workflows_file_with_backup(
+                                codex_home.as_path(),
+                                path.as_path(),
+                                &file,
+                            )?;
+                            if let Some(backup) = backup {
+                                println!(
+                                    "Updated workflows.json attachments (backup: {})",
+                                    backup.display()
+                                );
+                            } else {
+                                println!("Updated workflows.json attachments");
+                            }
+                        }
+                    }
+                }
+                ProfilesCommand::Interactive {
+                    project_root,
+                    scope,
+                } => {
+                    let project_root =
+                        require_project_root(discover_project_root(project_root), scope)?;
+                    println!("Profiles Interactive");
+                    println!("1) List");
+                    println!("2) Resolve");
+                    println!("3) Explain");
+                    let choice = prompt_feedback("Select action number")?;
+                    match choice.trim() {
+                        "1" => {
+                            let registry = load_registry_for_scope(
+                                codex_home.as_path(),
+                                project_root.as_deref(),
+                                scope,
+                            )?;
+                            println!(
+                                "policy_profiles={} guideline_profiles={}",
+                                registry.policy_profiles.len(),
+                                registry.guideline_profiles.len()
+                            );
+                        }
+                        "2" => {
+                            let payload = resolved_profiles_for_scope(
+                                codex_home.as_path(),
+                                project_root.as_deref(),
+                                scope,
+                                Vec::new(),
+                                Vec::new(),
+                                true,
+                            )?;
+                            println!("{}", serde_json::to_string_pretty(&payload)?);
+                        }
+                        "3" => {
+                            let payload = resolved_profiles_for_scope(
+                                codex_home.as_path(),
+                                project_root.as_deref(),
+                                scope,
+                                Vec::new(),
+                                Vec::new(),
+                                false,
+                            )?;
+                            println!("{}", serde_json::to_string_pretty(&payload)?);
+                        }
+                        _ => println!("No-op: unknown option"),
+                    }
+                }
+            }
+        }
+
         Command::Pipelines { command } => {
             let codex_home = find_codex_home()?;
             match command {
@@ -2195,6 +3660,7 @@ pub fn run() -> Result<()> {
                     workflows.insert(
                         "main".to_string(),
                         codex_pr_pipelines::Workflow {
+                            profile_refs: codex_pr_types::ProfileRefs::default(),
                             parts,
                             finally_workflow: None,
                         },
@@ -2230,6 +3696,7 @@ pub fn run() -> Result<()> {
                             id: entry.id,
                             name: entry.name,
                             enabled: entry.enabled,
+                            profile_refs: codex_pr_types::ProfileRefs::default(),
                             pipeline: entry.pipeline,
                         },
                     );
@@ -2391,11 +3858,13 @@ pub fn run() -> Result<()> {
                         "generate_prd_component".to_string(),
                         WorkflowComponentV1 {
                             params: BTreeMap::new(),
+                            profile_refs: codex_pr_types::ProfileRefs::default(),
                             step: WorkflowStepV1::GenerateArtifact {
                                 template_id: "prd".to_string(),
                                 artifact_kind: "prd".to_string(),
                                 inputs: BTreeMap::new(),
                                 next_step: None,
+                                profile_refs: codex_pr_types::ProfileRefs::default(),
                             },
                         },
                     );
@@ -2403,11 +3872,13 @@ pub fn run() -> Result<()> {
                         "revise_prd_component".to_string(),
                         WorkflowComponentV1 {
                             params: BTreeMap::new(),
+                            profile_refs: codex_pr_types::ProfileRefs::default(),
                             step: WorkflowStepV1::ReviseArtifact {
                                 template_id: "prd_revise".to_string(),
                                 artifact_ref: "prd".to_string(),
                                 feedback_key: "review_prd.feedback".to_string(),
                                 next_step: None,
+                                profile_refs: codex_pr_types::ProfileRefs::default(),
                             },
                         },
                     );
@@ -2415,11 +3886,13 @@ pub fn run() -> Result<()> {
                         "generate_ux_component".to_string(),
                         WorkflowComponentV1 {
                             params: BTreeMap::new(),
+                            profile_refs: codex_pr_types::ProfileRefs::default(),
                             step: WorkflowStepV1::GenerateArtifact {
                                 template_id: "ux_plan".to_string(),
                                 artifact_kind: "ux_plan".to_string(),
                                 inputs: BTreeMap::new(),
                                 next_step: None,
+                                profile_refs: codex_pr_types::ProfileRefs::default(),
                             },
                         },
                     );
@@ -2427,11 +3900,13 @@ pub fn run() -> Result<()> {
                         "revise_ux_component".to_string(),
                         WorkflowComponentV1 {
                             params: BTreeMap::new(),
+                            profile_refs: codex_pr_types::ProfileRefs::default(),
                             step: WorkflowStepV1::ReviseArtifact {
                                 template_id: "ux_plan_revise".to_string(),
                                 artifact_ref: "ux_plan".to_string(),
                                 feedback_key: "review_ux.feedback".to_string(),
                                 next_step: None,
+                                profile_refs: codex_pr_types::ProfileRefs::default(),
                             },
                         },
                     );
@@ -2442,6 +3917,7 @@ pub fn run() -> Result<()> {
                             component_id: "generate_prd_component".to_string(),
                             args: BTreeMap::new(),
                             next_step: Some("review_prd".to_string()),
+                            profile_refs: codex_pr_types::ProfileRefs::default(),
                         },
                     );
                     steps.insert(
@@ -2453,6 +3929,7 @@ pub fn run() -> Result<()> {
                             on_feedback: "revise_prd".to_string(),
                             max_revisions: 3,
                             revision_counter_key: "review_prd".to_string(),
+                            profile_refs: codex_pr_types::ProfileRefs::default(),
                         },
                     );
                     steps.insert(
@@ -2461,6 +3938,7 @@ pub fn run() -> Result<()> {
                             component_id: "revise_prd_component".to_string(),
                             args: BTreeMap::new(),
                             next_step: Some("review_prd".to_string()),
+                            profile_refs: codex_pr_types::ProfileRefs::default(),
                         },
                     );
                     steps.insert(
@@ -2469,6 +3947,7 @@ pub fn run() -> Result<()> {
                             component_id: "generate_ux_component".to_string(),
                             args: BTreeMap::new(),
                             next_step: Some("review_ux".to_string()),
+                            profile_refs: codex_pr_types::ProfileRefs::default(),
                         },
                     );
                     steps.insert(
@@ -2480,6 +3959,7 @@ pub fn run() -> Result<()> {
                             on_feedback: "revise_ux".to_string(),
                             max_revisions: 3,
                             revision_counter_key: "review_ux".to_string(),
+                            profile_refs: codex_pr_types::ProfileRefs::default(),
                         },
                     );
                     steps.insert(
@@ -2488,6 +3968,7 @@ pub fn run() -> Result<()> {
                             component_id: "revise_ux_component".to_string(),
                             args: BTreeMap::new(),
                             next_step: Some("review_ux".to_string()),
+                            profile_refs: codex_pr_types::ProfileRefs::default(),
                         },
                     );
                     steps.insert("complete".to_string(), WorkflowStepV1::Complete);
@@ -2496,6 +3977,7 @@ pub fn run() -> Result<()> {
                         id: id.clone(),
                         name,
                         enabled: false,
+                        profile_refs: codex_pr_types::ProfileRefs::default(),
                         workflow: WorkflowGraphV1 {
                             entry: "generate_prd".to_string(),
                             steps,

@@ -14,15 +14,21 @@ use codex_pr_audit::AuditEvent;
 use codex_pr_audit::AuditEventKind;
 use codex_pr_audit::AuditSink;
 use codex_pr_audit::JsonlAuditSink;
+use codex_pr_config::ConfigResolveScope;
 use codex_pr_config::resolve_printrevolt_config;
+use codex_pr_config::resolve_printrevolt_config_scoped;
 use codex_pr_hooks::HookRunner;
 use codex_pr_hooks::HookSpec;
 use codex_pr_policy::PolicyEngine;
+use codex_pr_profiles::ProfileProvenanceEntry;
+use codex_pr_profiles::load_profiles_registry;
+use codex_pr_profiles::resolve_subject_profiles;
 use codex_pr_templates::TemplateRef;
 use codex_pr_types::DecisionKind;
 use codex_pr_types::HookPayloadV2;
 use codex_pr_types::LifecycleEventKind;
 use codex_pr_types::PrintRevoltConfig;
+use codex_pr_types::ProfileRefs;
 use codex_pr_types::SessionContext;
 use codex_pr_types::ToolCall;
 use codex_pr_types::ToolCallDecision;
@@ -170,6 +176,9 @@ impl PrRuntime {
                 session_id = %session_id,
                 commands = init.commands.len(),
                 templates = init.templates.len(),
+                resolved_policy_fingerprint = %init.resolved_policy_fingerprint,
+                resolved_policy_profiles = init.resolved_policy_provenance.len(),
+                resolved_guidelines = init.resolved_guidelines.len(),
                 "printrevolt initialized"
             );
         }
@@ -424,6 +433,26 @@ impl PrRuntimeState {
             resolve_printrevolt_config(codex_home.as_path(), project_root.as_deref(), None);
         let cfg_toml = toml::to_string(&resolved.printrevolt).unwrap_or_default();
         let cfg: PrintRevoltConfig = toml::from_str(&cfg_toml).unwrap_or_default();
+        let resolved_global = resolve_printrevolt_config_scoped(
+            codex_home.as_path(),
+            project_root.as_deref(),
+            None,
+            ConfigResolveScope::Global,
+        );
+        let global_cfg_toml = toml::to_string(&resolved_global.printrevolt).unwrap_or_default();
+        let global_cfg: PrintRevoltConfig = toml::from_str(&global_cfg_toml).unwrap_or_default();
+
+        let repo_trusted = project_root.as_ref().is_some_and(|root| {
+            let root = root.to_string_lossy().to_string();
+            cfg.hooks.trusted_repo_roots.iter().any(|t| t == &root)
+        });
+
+        let profile_registry =
+            load_profiles_registry(codex_home.as_path(), project_root.as_deref(), repo_trusted)
+                .map_err(|err| anyhow::anyhow!("failed to load profile registries: {err}"))?;
+        for warning in &profile_registry.warnings {
+            tracing::warn!(warning = %warning, "profile registry warning");
+        }
 
         let global_commands_path = codex_home.join("printrevolt").join("commands.json");
         let global_commands = load_commands_file(&global_commands_path);
@@ -479,15 +508,42 @@ impl PrRuntimeState {
             None
         };
 
-        let policy = PolicyEngine::new(cfg.policy.clone())
+        let requested_profile_refs = if repo_trusted {
+            ProfileRefs {
+                policy_profiles: cfg.policy_profiles.clone(),
+                guideline_profiles: cfg.guideline_profiles.clone(),
+            }
+        } else {
+            ProfileRefs {
+                policy_profiles: global_cfg.policy_profiles.clone(),
+                guideline_profiles: global_cfg.guideline_profiles.clone(),
+            }
+        };
+        if !repo_trusted
+            && (!cfg.policy_profiles.is_empty() || !cfg.guideline_profiles.is_empty())
+            && (cfg.policy_profiles != global_cfg.policy_profiles
+                || cfg.guideline_profiles != global_cfg.guideline_profiles)
+        {
+            tracing::warn!(
+                "project-attached policy/guideline profile refs ignored (repo not trusted)"
+            );
+        }
+
+        let resolved_subject_profiles = resolve_subject_profiles(
+            &profile_registry,
+            &requested_profile_refs,
+            &cfg.policy,
+            &global_cfg.policy,
+        );
+        for warning in &resolved_subject_profiles.warnings {
+            tracing::warn!(warning = %warning, "profile resolution warning");
+        }
+
+        let policy = PolicyEngine::new(resolved_subject_profiles.effective_policy.clone())
             .map_err(|err| anyhow::anyhow!("failed to initialize policy engine: {err}"))?;
 
         let vars = cfg.vars.clone();
 
-        let repo_trusted = project_root.as_ref().is_some_and(|root| {
-            let root = root.to_string_lossy().to_string();
-            cfg.hooks.trusted_repo_roots.iter().any(|t| t == &root)
-        });
         let templates = codex_pr_templates::discover_templates(
             codex_home.as_path(),
             project_root.as_deref(),
@@ -511,6 +567,9 @@ impl PrRuntimeState {
             commands,
             templates: template_refs,
             policy,
+            resolved_policy_fingerprint: resolved_subject_profiles.fingerprint_sha256,
+            resolved_policy_provenance: resolved_subject_profiles.provenance,
+            resolved_guidelines: resolved_subject_profiles.guidelines,
             hook_runner: HookRunner,
             audit,
         });
@@ -526,6 +585,9 @@ struct PrRuntimeInit {
     commands: BTreeMap<String, codex_pr_types::CommandSpecV1>,
     templates: Vec<TemplateRef>,
     policy: PolicyEngine,
+    resolved_policy_fingerprint: String,
+    resolved_policy_provenance: Vec<ProfileProvenanceEntry>,
+    resolved_guidelines: Vec<String>,
     hook_runner: HookRunner,
     audit: Option<JsonlAuditSink>,
 }
