@@ -92,6 +92,14 @@ Built-in slash command availability is centralized in
 `codex-rs/tui/src/bottom_pane/slash_commands.rs` and reused by both the composer and the command
 popup so gating stays in sync.
 
+PrintRevolt integration notes:
+
+- `ChatWidget` may inject a persistent footer indicator showing the active PrintRevolt prompt
+  template and selection mode (for example `Template: … · Mode: …`).
+- A supervisor may disable specific slash command groups (templates/policy/pipelines). When
+  disabled, the command popup hides them and the composer prevents showing them in its inline
+  command UX.
+
 ## Submission flow (Enter/Tab)
 
 There are multiple submission paths, but they share the same core rules:

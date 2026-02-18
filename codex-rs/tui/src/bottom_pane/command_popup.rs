@@ -40,6 +40,9 @@ pub(crate) struct CommandPopupFlags {
     pub(crate) connectors_enabled: bool,
     pub(crate) personality_command_enabled: bool,
     pub(crate) windows_degraded_sandbox_active: bool,
+    pub(crate) printrevolt_disable_templates: bool,
+    pub(crate) printrevolt_disable_policy: bool,
+    pub(crate) printrevolt_disable_pipelines: bool,
 }
 
 impl CommandPopup {
@@ -50,6 +53,9 @@ impl CommandPopup {
             flags.connectors_enabled,
             flags.personality_command_enabled,
             flags.windows_degraded_sandbox_active,
+            flags.printrevolt_disable_templates,
+            flags.printrevolt_disable_policy,
+            flags.printrevolt_disable_pipelines,
         );
         // Exclude prompts that collide with builtin command names and sort by name.
         let exclude: HashSet<String> = builtins.iter().map(|(n, _)| (*n).to_string()).collect();

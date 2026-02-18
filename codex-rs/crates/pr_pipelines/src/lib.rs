@@ -14,6 +14,7 @@ use serde::Serialize;
 use thiserror::Error;
 
 pub type WorkflowId = String;
+pub type ComponentId = String;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -147,6 +148,24 @@ pub enum Part {
     Defer {
         part: Box<Part>,
     },
+    UseComponent {
+        id: ComponentId,
+        #[serde(default)]
+        args: BTreeMap<String, String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ParamSpecV2 {
+    #[serde(default)]
+    pub default: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComponentV2 {
+    #[serde(default)]
+    pub params: BTreeMap<String, ParamSpecV2>,
+    pub parts: Vec<Part>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -160,6 +179,24 @@ pub struct Workflow {
 pub struct Pipeline {
     pub workflows: BTreeMap<WorkflowId, Workflow>,
     pub entry: WorkflowId,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PipelineEntryV2 {
+    pub id: String,
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub pipeline: Pipeline,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PipelineBundleV2 {
+    pub schema_version: String,
+    #[serde(default)]
+    pub components: BTreeMap<ComponentId, ComponentV2>,
+    #[serde(default)]
+    pub pipelines: BTreeMap<String, PipelineEntryV2>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -314,10 +351,530 @@ pub enum PipelineError {
     UnknownCommandId(String),
     #[error("missing repo_root for git operation")]
     MissingRepoRoot,
+    #[error("unknown component_id: {0}")]
+    UnknownComponent(String),
+    #[error("component cycle: {0:?}")]
+    ComponentCycle(Vec<String>),
+    #[error("missing component param: component_id={component_id} param={param}")]
+    MissingComponentParam { component_id: String, param: String },
+    #[error("unknown component param reference: component_id={component_id} param={param}")]
+    UnknownComponentParamReference { component_id: String, param: String },
+    #[error("invalid component arg: component_id={component_id} param={param}: {message}")]
+    InvalidComponentArg {
+        component_id: String,
+        param: String,
+        message: String,
+    },
+    #[error("component expansion limit exceeded: {0}")]
+    ExpandLimitsExceeded(String),
 }
 
 pub trait CommandResolver {
     fn resolve(&self, command_id: &str) -> Option<CommandSpecV1>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpandLimits {
+    pub max_depth: usize,
+    pub max_expanded_parts: usize,
+    pub max_total_string_bytes: usize,
+}
+
+impl Default for ExpandLimits {
+    fn default() -> Self {
+        Self {
+            max_depth: 8,
+            max_expanded_parts: 5_000,
+            max_total_string_bytes: 1_000_000,
+        }
+    }
+}
+
+pub fn expand_pipeline(
+    pipeline: &Pipeline,
+    components: &BTreeMap<ComponentId, ComponentV2>,
+    limits: ExpandLimits,
+) -> Result<Pipeline, PipelineError> {
+    let mut total_parts = 0usize;
+    let mut total_string_bytes = 0usize;
+    let mut stack = Vec::<ComponentId>::new();
+
+    let mut workflows = BTreeMap::new();
+    for (workflow_id, workflow) in &pipeline.workflows {
+        workflows.insert(
+            workflow_id.clone(),
+            Workflow {
+                parts: expand_parts(
+                    workflow.parts.as_slice(),
+                    components,
+                    &limits,
+                    &mut stack,
+                    "<pipeline>",
+                    0,
+                    &mut total_parts,
+                    &mut total_string_bytes,
+                )?,
+                finally_workflow: workflow.finally_workflow.clone(),
+            },
+        );
+    }
+
+    Ok(Pipeline {
+        workflows,
+        entry: pipeline.entry.clone(),
+    })
+}
+
+fn expand_parts(
+    parts: &[Part],
+    components: &BTreeMap<ComponentId, ComponentV2>,
+    limits: &ExpandLimits,
+    stack: &mut Vec<ComponentId>,
+    context_component_id: &str,
+    depth: usize,
+    total_parts: &mut usize,
+    total_string_bytes: &mut usize,
+) -> Result<Vec<Part>, PipelineError> {
+    if depth > limits.max_depth {
+        return Err(PipelineError::ExpandLimitsExceeded(format!(
+            "max_depth={}",
+            limits.max_depth
+        )));
+    }
+
+    let mut out = Vec::new();
+    for part in parts {
+        match part {
+            Part::UseComponent { id, args } => {
+                if stack.iter().any(|c| c == id) {
+                    let mut cycle = stack.clone();
+                    cycle.push(id.clone());
+                    return Err(PipelineError::ComponentCycle(cycle));
+                }
+                let component = components
+                    .get(id)
+                    .ok_or_else(|| PipelineError::UnknownComponent(id.clone()))?;
+
+                let effective_args = build_component_args(id.as_str(), component, args)?;
+                stack.push(id.clone());
+
+                let substituted = component
+                    .parts
+                    .iter()
+                    .map(|p| {
+                        substitute_params_in_part(
+                            id.as_str(),
+                            p,
+                            &effective_args,
+                            total_string_bytes,
+                            limits,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                let expanded = expand_parts(
+                    substituted.as_slice(),
+                    components,
+                    limits,
+                    stack,
+                    id.as_str(),
+                    depth + 1,
+                    total_parts,
+                    total_string_bytes,
+                )?;
+                stack.pop();
+
+                out.extend(expanded);
+            }
+            other => out.push(substitute_params_in_part(
+                context_component_id,
+                other,
+                &BTreeMap::new(),
+                total_string_bytes,
+                limits,
+            )?),
+        }
+
+        *total_parts += 1;
+        if *total_parts > limits.max_expanded_parts {
+            return Err(PipelineError::ExpandLimitsExceeded(format!(
+                "max_expanded_parts={}",
+                limits.max_expanded_parts
+            )));
+        }
+    }
+
+    Ok(out)
+}
+
+fn build_component_args(
+    component_id: &str,
+    component: &ComponentV2,
+    call_args: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, PipelineError> {
+    let mut args = BTreeMap::new();
+    for (param, spec) in &component.params {
+        if let Some(default) = spec.default.as_ref() {
+            validate_component_arg(component_id, param.as_str(), default.as_str())?;
+            args.insert(param.clone(), default.clone());
+        }
+    }
+    for (param, value) in call_args {
+        validate_component_arg(component_id, param.as_str(), value.as_str())?;
+        args.insert(param.clone(), value.clone());
+    }
+    for (param, spec) in &component.params {
+        if spec.default.is_none() && !args.contains_key(param) {
+            return Err(PipelineError::MissingComponentParam {
+                component_id: component_id.to_string(),
+                param: param.clone(),
+            });
+        }
+    }
+    Ok(args)
+}
+
+fn validate_component_arg(
+    component_id: &str,
+    param: &str,
+    value: &str,
+) -> Result<(), PipelineError> {
+    if value.contains("${") {
+        return Err(PipelineError::InvalidComponentArg {
+            component_id: component_id.to_string(),
+            param: param.to_string(),
+            message: "component args must be literal strings (no ${...})".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn substitute_params_in_part(
+    component_id: &str,
+    part: &Part,
+    args: &BTreeMap<String, String>,
+    total_string_bytes: &mut usize,
+    limits: &ExpandLimits,
+) -> Result<Part, PipelineError> {
+    match part {
+        Part::RunTool { tool_call } => Ok(Part::RunTool {
+            tool_call: substitute_params_in_tool_call(
+                component_id,
+                tool_call,
+                args,
+                total_string_bytes,
+                limits,
+            )?,
+        }),
+        Part::RunCommand {
+            cwd,
+            argv,
+            command_id,
+            timeout_ms,
+            child_process_policy,
+        } => Ok(Part::RunCommand {
+            cwd: cwd
+                .as_deref()
+                .map(|s| {
+                    substitute_params_in_str(component_id, s, args, total_string_bytes, limits)
+                })
+                .transpose()?,
+            argv: argv
+                .as_ref()
+                .map(|v| {
+                    v.iter()
+                        .map(|s| {
+                            substitute_params_in_str(
+                                component_id,
+                                s,
+                                args,
+                                total_string_bytes,
+                                limits,
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .transpose()?,
+            command_id: command_id.clone(),
+            timeout_ms: *timeout_ms,
+            child_process_policy: *child_process_policy,
+        }),
+        Part::RequireApproval {
+            scope,
+            mode,
+            prompt,
+            remediation,
+            action_hash,
+            output_key,
+        } => Ok(Part::RequireApproval {
+            scope: scope.clone(),
+            mode: mode.clone(),
+            prompt: substitute_params_in_str(
+                component_id,
+                prompt,
+                args,
+                total_string_bytes,
+                limits,
+            )?,
+            remediation: remediation
+                .iter()
+                .map(|s| {
+                    substitute_params_in_str(component_id, s, args, total_string_bytes, limits)
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            action_hash: action_hash.clone(),
+            output_key: output_key.clone(),
+        }),
+        Part::ExtractValue {
+            source,
+            parser,
+            output_key,
+            normalize,
+        } => Ok(Part::ExtractValue {
+            source: source.clone(),
+            parser: match parser {
+                ExtractParser::JsonPath { json_path } => ExtractParser::JsonPath {
+                    json_path: substitute_params_in_str(
+                        component_id,
+                        json_path,
+                        args,
+                        total_string_bytes,
+                        limits,
+                    )?,
+                },
+                ExtractParser::Regex { pattern, group } => ExtractParser::Regex {
+                    pattern: substitute_params_in_str(
+                        component_id,
+                        pattern,
+                        args,
+                        total_string_bytes,
+                        limits,
+                    )?,
+                    group: *group,
+                },
+            },
+            output_key: substitute_params_in_str(
+                component_id,
+                output_key,
+                args,
+                total_string_bytes,
+                limits,
+            )?,
+            normalize: normalize.clone(),
+        }),
+        Part::AssertFact {
+            key,
+            equals,
+            matches_regex,
+        } => Ok(Part::AssertFact {
+            key: substitute_params_in_str(component_id, key, args, total_string_bytes, limits)?,
+            equals: equals
+                .as_deref()
+                .map(|s| {
+                    substitute_params_in_str(component_id, s, args, total_string_bytes, limits)
+                })
+                .transpose()?,
+            matches_regex: matches_regex
+                .as_deref()
+                .map(|s| {
+                    substitute_params_in_str(component_id, s, args, total_string_bytes, limits)
+                })
+                .transpose()?,
+        }),
+        Part::EnsureWorktree {
+            worktree_root,
+            naming,
+            base_branch,
+            branch_name,
+            require_approval,
+        } => Ok(Part::EnsureWorktree {
+            worktree_root: substitute_params_in_str(
+                component_id,
+                worktree_root,
+                args,
+                total_string_bytes,
+                limits,
+            )?,
+            naming: substitute_params_in_str(
+                component_id,
+                naming,
+                args,
+                total_string_bytes,
+                limits,
+            )?,
+            base_branch: base_branch.clone(),
+            branch_name: substitute_params_in_str(
+                component_id,
+                branch_name,
+                args,
+                total_string_bytes,
+                limits,
+            )?,
+            require_approval: *require_approval,
+        }),
+        Part::EnsureBranch {
+            base_branch,
+            branch_name,
+            protected_branches,
+            require_approval,
+        } => Ok(Part::EnsureBranch {
+            base_branch: base_branch.clone(),
+            branch_name: substitute_params_in_str(
+                component_id,
+                branch_name,
+                args,
+                total_string_bytes,
+                limits,
+            )?,
+            protected_branches: protected_branches
+                .iter()
+                .map(|s| {
+                    substitute_params_in_str(component_id, s, args, total_string_bytes, limits)
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            require_approval: *require_approval,
+        }),
+        Part::SetVar { key, value } => Ok(Part::SetVar {
+            key: substitute_params_in_str(component_id, key, args, total_string_bytes, limits)?,
+            value: substitute_params_in_str(component_id, value, args, total_string_bytes, limits)?,
+        }),
+        Part::Fail { message } => Ok(Part::Fail {
+            message: substitute_params_in_str(
+                component_id,
+                message,
+                args,
+                total_string_bytes,
+                limits,
+            )?,
+        }),
+        Part::Defer { part } => Ok(Part::Defer {
+            part: Box::new(substitute_params_in_part(
+                component_id,
+                part,
+                args,
+                total_string_bytes,
+                limits,
+            )?),
+        }),
+        Part::UseComponent {
+            id,
+            args: call_args,
+        } => Ok(Part::UseComponent {
+            id: substitute_params_in_str(component_id, id, args, total_string_bytes, limits)?,
+            args: call_args
+                .iter()
+                .map(|(k, v)| {
+                    Ok((
+                        substitute_params_in_str(
+                            component_id,
+                            k,
+                            args,
+                            total_string_bytes,
+                            limits,
+                        )?,
+                        substitute_params_in_str(
+                            component_id,
+                            v,
+                            args,
+                            total_string_bytes,
+                            limits,
+                        )?,
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>, _>>()?,
+        }),
+    }
+}
+
+fn substitute_params_in_tool_call(
+    component_id: &str,
+    call: &ToolCall,
+    args: &BTreeMap<String, String>,
+    total_string_bytes: &mut usize,
+    limits: &ExpandLimits,
+) -> Result<ToolCall, PipelineError> {
+    Ok(ToolCall {
+        call_id: call.call_id.clone(),
+        tool_name: call.tool_name.clone(),
+        tool_kind: call.tool_kind.clone(),
+        input: match &call.input {
+            ToolInput::LocalShell { command, workdir } => ToolInput::LocalShell {
+                command: command
+                    .iter()
+                    .map(|s| {
+                        substitute_params_in_str(component_id, s, args, total_string_bytes, limits)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                workdir: workdir
+                    .as_deref()
+                    .map(|s| {
+                        substitute_params_in_str(component_id, s, args, total_string_bytes, limits)
+                    })
+                    .transpose()?,
+            },
+            other => other.clone(),
+        },
+    })
+}
+
+fn substitute_params_in_str(
+    component_id: &str,
+    input: &str,
+    args: &BTreeMap<String, String>,
+    total_string_bytes: &mut usize,
+    limits: &ExpandLimits,
+) -> Result<String, PipelineError> {
+    // Only substitute ${param.NAME} placeholders.
+    if !input.contains("${param.") {
+        return Ok(input.to_string());
+    }
+    let mut out = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'$'
+            && i + 7 < bytes.len()
+            && bytes[i + 1] == b'{'
+            && bytes[i + 2] == b'p'
+            && bytes[i + 3] == b'a'
+            && bytes[i + 4] == b'r'
+            && bytes[i + 5] == b'a'
+            && bytes[i + 6] == b'm'
+            && bytes[i + 7] == b'.'
+        {
+            let start = i + 8;
+            let mut end = start;
+            while end < bytes.len() && bytes[end] != b'}' {
+                end += 1;
+            }
+            if end >= bytes.len() {
+                return Err(PipelineError::TemplateError(
+                    "unclosed ${param.*} placeholder".to_string(),
+                ));
+            }
+            let key = &input[start..end];
+            let value =
+                args.get(key)
+                    .ok_or_else(|| PipelineError::UnknownComponentParamReference {
+                        component_id: component_id.to_string(),
+                        param: key.to_string(),
+                    })?;
+            out.push_str(value);
+            i = end + 1;
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+
+    *total_string_bytes += out.len();
+    if *total_string_bytes > limits.max_total_string_bytes {
+        return Err(PipelineError::ExpandLimitsExceeded(format!(
+            "max_total_string_bytes={}",
+            limits.max_total_string_bytes
+        )));
+    }
+    Ok(out)
 }
 
 pub struct PipelineEngine {
@@ -752,6 +1309,9 @@ impl PipelineEngine {
                     message: "defer: registered".to_string(),
                 })
             }
+            Part::UseComponent { .. } => Err(PipelineError::InvalidPart(
+                "use_component must be expanded before execution".to_string(),
+            )),
         }
     }
 }
@@ -765,6 +1325,10 @@ fn child_process_policy_supported(policy: ChildProcessPolicy) -> bool {
 }
 
 fn default_require_approval_true() -> bool {
+    true
+}
+
+fn default_true() -> bool {
     true
 }
 

@@ -14,6 +14,9 @@ pub(crate) fn builtins_for_input(
     connectors_enabled: bool,
     personality_command_enabled: bool,
     allow_elevate_sandbox: bool,
+    printrevolt_disable_templates: bool,
+    printrevolt_disable_policy: bool,
+    printrevolt_disable_pipelines: bool,
 ) -> Vec<(&'static str, SlashCommand)> {
     built_in_slash_commands()
         .into_iter()
@@ -24,6 +27,9 @@ pub(crate) fn builtins_for_input(
         })
         .filter(|(_, cmd)| connectors_enabled || *cmd != SlashCommand::Apps)
         .filter(|(_, cmd)| personality_command_enabled || *cmd != SlashCommand::Personality)
+        .filter(|(_, cmd)| !printrevolt_disable_templates || *cmd != SlashCommand::Templates)
+        .filter(|(_, cmd)| !printrevolt_disable_policy || *cmd != SlashCommand::Policy)
+        .filter(|(_, cmd)| !printrevolt_disable_pipelines || *cmd != SlashCommand::Pipelines)
         .collect()
 }
 
@@ -40,6 +46,9 @@ pub(crate) fn find_builtin_command(
         connectors_enabled,
         personality_command_enabled,
         allow_elevate_sandbox,
+        false,
+        false,
+        false,
     )
     .into_iter()
     .find(|(command_name, _)| *command_name == name)
@@ -53,12 +62,18 @@ pub(crate) fn has_builtin_prefix(
     connectors_enabled: bool,
     personality_command_enabled: bool,
     allow_elevate_sandbox: bool,
+    printrevolt_disable_templates: bool,
+    printrevolt_disable_policy: bool,
+    printrevolt_disable_pipelines: bool,
 ) -> bool {
     builtins_for_input(
         collaboration_modes_enabled,
         connectors_enabled,
         personality_command_enabled,
         allow_elevate_sandbox,
+        printrevolt_disable_templates,
+        printrevolt_disable_policy,
+        printrevolt_disable_pipelines,
     )
     .into_iter()
     .any(|(command_name, _)| fuzzy_match(command_name, name).is_some())

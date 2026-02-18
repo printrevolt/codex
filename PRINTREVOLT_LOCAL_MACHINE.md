@@ -22,6 +22,24 @@ PrintRevolt-specific docs:
 
 ## Build / install options
 
+### Recommended: installer script (`npm run pr:install`)
+
+This repo includes an installer that:
+- builds the Rust binaries (unless `--no-build` is set)
+- installs shims into `~/.local/bin` (or `--shim-dir`)
+- uses an isolated `CODEX_HOME` by default (`~/.codex-printrevolt`)
+- can inherit/link your upstream Codex config/auth (non-destructive)
+
+Recommended invocation (inherits upstream config/auth via symlinks, and writes safe-by-default PrintRevolt config):
+
+```bash
+npm run pr:install -- --bootstrap --init-config --inherit-global --inherit-config --inherit-auth --inherit-mode symlink
+```
+
+Notes:
+- This repo root does not define `npm run build`. Building the upstream TypeScript CLI uses `pnpm run build` under `codex/codex-cli/` (separate from PrintRevolt’s Rust build).
+- For installer flags: `npm run pr:install -- --help`.
+
 ### Recommended: build with the PrintRevolt dev bootstrap toolchain
 
 From the repo root:
@@ -88,6 +106,7 @@ Minimal Mode B config to enable the key behaviors:
 enabled = true
 
 [printrevolt.policy]
+enabled = true
 deny_dangerous_always = true
 
 [printrevolt.policy.verify]
@@ -109,6 +128,16 @@ enabled = true
 enabled = false
 trusted_repo_roots = []
 ```
+
+Notes:
+- Safe defaults are intentionally off:
+  - policy enforcement defaults to disabled (`printrevolt.policy.enabled=false`)
+  - pipelines default to disabled (`printrevolt.pipelines.enabled=false`)
+  - templates UI defaults to off (`printrevolt.templates.selection_mode="off"`)
+- You can toggle these via:
+  - `codex-pr policy enable|disable --scope global|project`
+  - `codex-pr pipelines enable|disable --scope global|project`
+  - `codex-pr templates enable|disable --scope global|project`
 
 ## What to test (covers PrintRevolt features wired into upstream)
 

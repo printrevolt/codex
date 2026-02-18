@@ -65,6 +65,13 @@ pub struct PrintRevoltPaths {
     pub project_printrevolt_toml: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigResolveScope {
+    Global,
+    Project,
+    Both,
+}
+
 pub fn compute_paths(codex_home: &Path, project_root: Option<&Path>) -> PrintRevoltPaths {
     let user_config_toml = codex_home.join("config.toml");
     let user_printrevolt_toml = codex_home.join("printrevolt.toml");
@@ -93,6 +100,20 @@ pub fn resolve_printrevolt_config(
     project_root: Option<&Path>,
     cli_overrides: Option<TomlValue>,
 ) -> ResolvedPrintRevoltConfig {
+    resolve_printrevolt_config_scoped(
+        codex_home,
+        project_root,
+        cli_overrides,
+        ConfigResolveScope::Both,
+    )
+}
+
+pub fn resolve_printrevolt_config_scoped(
+    codex_home: &Path,
+    project_root: Option<&Path>,
+    cli_overrides: Option<TomlValue>,
+    scope: ConfigResolveScope,
+) -> ResolvedPrintRevoltConfig {
     let mut sources = Vec::new();
     let mut warnings = Vec::new();
 
@@ -102,52 +123,59 @@ pub fn resolve_printrevolt_config(
     let mut merged = defaults.clone();
     let mut trace = init_trace_from_defaults(&defaults, ConfigSource::Defaults);
 
-    // user Mode A then user Mode B (Mode B wins per-field).
-    merged = merge_layer(
-        merged,
-        read_mode_a_printrevolt_table(
-            &paths.user_config_toml,
-            |file| ConfigSource::UserModeA { file },
-            &mut sources,
-            &mut warnings,
-        ),
-        &mut trace,
-    );
-    merged = merge_layer(
-        merged,
-        read_mode_b_printrevolt_value(
-            &paths.user_printrevolt_toml,
-            |file| ConfigSource::UserModeB { file },
-            &mut sources,
-            &mut warnings,
-        ),
-        &mut trace,
-    );
-
-    // project Mode A then project Mode B (Mode B wins per-field).
-    if let Some(project_mode_a) = paths.project_config_toml.as_deref() {
+    if matches!(scope, ConfigResolveScope::Global | ConfigResolveScope::Both) {
+        // user Mode A then user Mode B (Mode B wins per-field).
         merged = merge_layer(
             merged,
             read_mode_a_printrevolt_table(
-                project_mode_a,
-                |file| ConfigSource::ProjectModeA { file },
+                &paths.user_config_toml,
+                |file| ConfigSource::UserModeA { file },
+                &mut sources,
+                &mut warnings,
+            ),
+            &mut trace,
+        );
+        merged = merge_layer(
+            merged,
+            read_mode_b_printrevolt_value(
+                &paths.user_printrevolt_toml,
+                |file| ConfigSource::UserModeB { file },
                 &mut sources,
                 &mut warnings,
             ),
             &mut trace,
         );
     }
-    if let Some(project_mode_b) = paths.project_printrevolt_toml.as_deref() {
-        merged = merge_layer(
-            merged,
-            read_mode_b_printrevolt_value(
-                project_mode_b,
-                |file| ConfigSource::ProjectModeB { file },
-                &mut sources,
-                &mut warnings,
-            ),
-            &mut trace,
-        );
+
+    if matches!(
+        scope,
+        ConfigResolveScope::Project | ConfigResolveScope::Both
+    ) {
+        // project Mode A then project Mode B (Mode B wins per-field).
+        if let Some(project_mode_a) = paths.project_config_toml.as_deref() {
+            merged = merge_layer(
+                merged,
+                read_mode_a_printrevolt_table(
+                    project_mode_a,
+                    |file| ConfigSource::ProjectModeA { file },
+                    &mut sources,
+                    &mut warnings,
+                ),
+                &mut trace,
+            );
+        }
+        if let Some(project_mode_b) = paths.project_printrevolt_toml.as_deref() {
+            merged = merge_layer(
+                merged,
+                read_mode_b_printrevolt_value(
+                    project_mode_b,
+                    |file| ConfigSource::ProjectModeB { file },
+                    &mut sources,
+                    &mut warnings,
+                ),
+                &mut trace,
+            );
+        }
     }
 
     // Session overlay (Mode B); higher precedence than project/user, lower than CLI overrides.
@@ -277,6 +305,37 @@ fn lock_path_for(target: &Path) -> PathBuf {
 fn default_printrevolt_table() -> TomlValue {
     let mut root = toml::map::Map::new();
     root.insert("enabled".to_string(), TomlValue::Boolean(true));
+    let mut policy = toml::map::Map::new();
+    policy.insert("enabled".to_string(), TomlValue::Boolean(false));
+    root.insert("policy".to_string(), TomlValue::Table(policy));
+    root.insert("hooks".to_string(), TomlValue::Table(toml::map::Map::new()));
+    root.insert("audit".to_string(), TomlValue::Table(toml::map::Map::new()));
+    let mut pipelines = toml::map::Map::new();
+    pipelines.insert("enabled".to_string(), TomlValue::Boolean(false));
+    root.insert("pipelines".to_string(), TomlValue::Table(pipelines));
+
+    let mut templates = toml::map::Map::new();
+    templates.insert(
+        "selection_mode".to_string(),
+        TomlValue::String("off".to_string()),
+    );
+    templates.insert(
+        "default_for_picker_template_id".to_string(),
+        TomlValue::String(String::new()),
+    );
+    root.insert("templates".to_string(), TomlValue::Table(templates));
+
+    let mut ui = toml::map::Map::new();
+    ui.insert(
+        "disabled_slash_commands".to_string(),
+        TomlValue::Array(Vec::new()),
+    );
+    root.insert("ui".to_string(), TomlValue::Table(ui));
+
+    root.insert(
+        "agents".to_string(),
+        TomlValue::Table(toml::map::Map::new()),
+    );
     root.insert("vars".to_string(), TomlValue::Table(toml::map::Map::new()));
     TomlValue::Table(root)
 }

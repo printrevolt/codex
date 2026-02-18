@@ -1,6 +1,7 @@
 use super::new_status_output;
 use super::rate_limit_snapshot_display;
 use crate::history_cell::HistoryCell;
+use crate::version::CODEX_CLI_VERSION;
 use chrono::Duration as ChronoDuration;
 use chrono::TimeZone;
 use chrono::Utc;
@@ -62,6 +63,16 @@ fn render_lines(lines: &[Line<'static>]) -> Vec<String> {
 }
 
 fn sanitize_directory(lines: Vec<String>) -> Vec<String> {
+    let current_version = format!("(v{CODEX_CLI_VERSION})");
+    let stable_version_base = "(v0.0.0)";
+    let stable_version = if current_version.len() > stable_version_base.len() {
+        format!(
+            "{stable_version_base}{}",
+            " ".repeat(current_version.len() - stable_version_base.len())
+        )
+    } else {
+        stable_version_base.to_string()
+    };
     lines
         .into_iter()
         .map(|line| {
@@ -76,9 +87,9 @@ fn sanitize_directory(lines: Vec<String>) -> Vec<String> {
                     rebuilt.push_str(&" ".repeat(content_width - replacement.len()));
                 }
                 rebuilt.push_str(suffix);
-                rebuilt
+                rebuilt.replace(&current_version, &stable_version)
             } else {
-                line
+                line.replace(&current_version, &stable_version)
             }
         })
         .collect()

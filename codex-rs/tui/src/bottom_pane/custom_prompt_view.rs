@@ -23,6 +23,7 @@ use super::textarea::TextAreaState;
 
 /// Callback invoked when the user submits a custom prompt.
 pub(crate) type PromptSubmitted = Box<dyn Fn(String) + Send + Sync>;
+pub(crate) type PromptCancelled = Box<dyn Fn() + Send + Sync>;
 
 /// Minimal multi-line text input view to collect custom review instructions.
 pub(crate) struct CustomPromptView {
@@ -30,6 +31,8 @@ pub(crate) struct CustomPromptView {
     placeholder: String,
     context_label: Option<String>,
     on_submit: PromptSubmitted,
+    on_cancel: Option<PromptCancelled>,
+    allow_empty_submit: bool,
 
     // UI state
     textarea: TextArea,
@@ -44,12 +47,38 @@ impl CustomPromptView {
         context_label: Option<String>,
         on_submit: PromptSubmitted,
     ) -> Self {
+        Self::new_with_callbacks(
+            title,
+            placeholder,
+            context_label,
+            None,
+            false,
+            on_submit,
+            None,
+        )
+    }
+
+    pub(crate) fn new_with_callbacks(
+        title: String,
+        placeholder: String,
+        context_label: Option<String>,
+        initial_text: Option<String>,
+        allow_empty_submit: bool,
+        on_submit: PromptSubmitted,
+        on_cancel: Option<PromptCancelled>,
+    ) -> Self {
+        let mut textarea = TextArea::new();
+        if let Some(initial_text) = initial_text {
+            textarea.insert_str(&initial_text);
+        }
         Self {
             title,
             placeholder,
             context_label,
             on_submit,
-            textarea: TextArea::new(),
+            on_cancel,
+            allow_empty_submit,
+            textarea,
             textarea_state: RefCell::new(TextAreaState::default()),
             complete: false,
         }
@@ -70,7 +99,7 @@ impl BottomPaneView for CustomPromptView {
                 ..
             } => {
                 let text = self.textarea.text().trim().to_string();
-                if !text.is_empty() {
+                if self.allow_empty_submit || !text.is_empty() {
                     (self.on_submit)(text);
                     self.complete = true;
                 }
@@ -89,6 +118,9 @@ impl BottomPaneView for CustomPromptView {
 
     fn on_ctrl_c(&mut self) -> CancellationEvent {
         self.complete = true;
+        if let Some(cb) = self.on_cancel.as_ref() {
+            cb();
+        }
         CancellationEvent::Handled
     }
 

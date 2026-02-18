@@ -70,6 +70,13 @@ pub(crate) struct FooterProps {
     pub(crate) context_window_used_tokens: Option<i64>,
     pub(crate) status_line_value: Option<Line<'static>>,
     pub(crate) status_line_enabled: bool,
+    pub(crate) printrevolt_template_indicator: Option<PrintRevoltTemplateIndicator>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PrintRevoltTemplateIndicator {
+    pub(crate) template: String,
+    pub(crate) mode: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -571,7 +578,11 @@ fn footer_from_props_lines(
             FooterMode::ComposerEmpty | FooterMode::ComposerHasDraft
         )
     {
-        return vec![status_line.clone().dim()];
+        let mut line = status_line.clone().dim();
+        if let Some(indicator) = props.printrevolt_template_indicator.as_ref() {
+            line = append_template_indicator(line, indicator);
+        }
+        return vec![line];
     }
     match props.mode {
         FooterMode::QuitShortcutReminder => {
@@ -586,7 +597,11 @@ fn footer_from_props_lines(
                 },
                 show_cycle_hint,
             };
-            vec![left_side_line(collaboration_mode_indicator, state)]
+            let mut line = left_side_line(collaboration_mode_indicator, state);
+            if let Some(indicator) = props.printrevolt_template_indicator.as_ref() {
+                line = append_template_indicator(line, indicator);
+            }
+            vec![line]
         }
         FooterMode::ShortcutOverlay => {
             let state = ShortcutsState {
@@ -607,7 +622,11 @@ fn footer_from_props_lines(
                 },
                 show_cycle_hint,
             };
-            vec![left_side_line(collaboration_mode_indicator, state)]
+            let mut line = left_side_line(collaboration_mode_indicator, state);
+            if let Some(indicator) = props.printrevolt_template_indicator.as_ref() {
+                line = append_template_indicator(line, indicator);
+            }
+            vec![line]
         }
     }
 }
@@ -649,6 +668,19 @@ fn footer_hint_items_line(items: &[(String, String)]) -> Line<'static> {
         }
     }
     Line::from(spans)
+}
+
+fn append_template_indicator(
+    mut line: Line<'static>,
+    indicator: &PrintRevoltTemplateIndicator,
+) -> Line<'static> {
+    line.push_span("  · ".dim());
+    line.push_span("Template: ".dim());
+    line.push_span(indicator.template.clone().dim());
+    line.push_span("  · ".dim());
+    line.push_span("Mode: ".dim());
+    line.push_span(indicator.mode.clone().dim());
+    line
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1197,6 +1229,7 @@ mod tests {
                 context_window_used_tokens: None,
                 status_line_value: None,
                 status_line_enabled: false,
+                printrevolt_template_indicator: None,
             },
         );
 
@@ -1215,6 +1248,7 @@ mod tests {
                 context_window_used_tokens: None,
                 status_line_value: None,
                 status_line_enabled: false,
+                printrevolt_template_indicator: None,
             },
         );
 
@@ -1233,6 +1267,7 @@ mod tests {
                 context_window_used_tokens: None,
                 status_line_value: None,
                 status_line_enabled: false,
+                printrevolt_template_indicator: None,
             },
         );
 
@@ -1251,6 +1286,7 @@ mod tests {
                 context_window_used_tokens: None,
                 status_line_value: None,
                 status_line_enabled: false,
+                printrevolt_template_indicator: None,
             },
         );
 
@@ -1269,6 +1305,7 @@ mod tests {
                 context_window_used_tokens: None,
                 status_line_value: None,
                 status_line_enabled: false,
+                printrevolt_template_indicator: None,
             },
         );
 
@@ -1287,6 +1324,7 @@ mod tests {
                 context_window_used_tokens: None,
                 status_line_value: None,
                 status_line_enabled: false,
+                printrevolt_template_indicator: None,
             },
         );
 
@@ -1305,6 +1343,7 @@ mod tests {
                 context_window_used_tokens: None,
                 status_line_value: None,
                 status_line_enabled: false,
+                printrevolt_template_indicator: None,
             },
         );
 
@@ -1323,6 +1362,7 @@ mod tests {
                 context_window_used_tokens: None,
                 status_line_value: None,
                 status_line_enabled: false,
+                printrevolt_template_indicator: None,
             },
         );
 
@@ -1341,6 +1381,7 @@ mod tests {
                 context_window_used_tokens: Some(123_456),
                 status_line_value: None,
                 status_line_enabled: false,
+                printrevolt_template_indicator: None,
             },
         );
 
@@ -1359,6 +1400,7 @@ mod tests {
                 context_window_used_tokens: None,
                 status_line_value: None,
                 status_line_enabled: false,
+                printrevolt_template_indicator: None,
             },
         );
 
@@ -1377,6 +1419,7 @@ mod tests {
                 context_window_used_tokens: None,
                 status_line_value: None,
                 status_line_enabled: false,
+                printrevolt_template_indicator: None,
             },
         );
 
@@ -1393,6 +1436,7 @@ mod tests {
             context_window_used_tokens: None,
             status_line_value: None,
             status_line_enabled: false,
+            printrevolt_template_indicator: None,
         };
 
         snapshot_footer_with_mode_indicator(
@@ -1422,6 +1466,7 @@ mod tests {
             context_window_used_tokens: None,
             status_line_value: None,
             status_line_enabled: false,
+            printrevolt_template_indicator: None,
         };
 
         snapshot_footer_with_mode_indicator(
@@ -1444,6 +1489,7 @@ mod tests {
             context_window_used_tokens: None,
             status_line_value: Some(Line::from("Status line content".to_string())),
             status_line_enabled: true,
+            printrevolt_template_indicator: None,
         };
 
         snapshot_footer("footer_status_line_overrides_shortcuts", props);
@@ -1461,6 +1507,7 @@ mod tests {
             context_window_used_tokens: None,
             status_line_value: None, // command timed out / empty
             status_line_enabled: true,
+            printrevolt_template_indicator: None,
         };
 
         snapshot_footer_with_mode_indicator(
@@ -1483,6 +1530,7 @@ mod tests {
             context_window_used_tokens: None,
             status_line_value: None,
             status_line_enabled: false,
+            printrevolt_template_indicator: None,
         };
 
         snapshot_footer_with_mode_indicator(
@@ -1505,6 +1553,7 @@ mod tests {
             context_window_used_tokens: None,
             status_line_value: None,
             status_line_enabled: true,
+            printrevolt_template_indicator: None,
         };
 
         // has status line and no collaboration mode
@@ -1530,6 +1579,7 @@ mod tests {
                 "Status line content that should truncate before the mode indicator".to_string(),
             )),
             status_line_enabled: true,
+            printrevolt_template_indicator: None,
         };
 
         snapshot_footer_with_mode_indicator(
@@ -1558,6 +1608,7 @@ mod tests {
                     .to_string(),
             )),
             status_line_enabled: true,
+            printrevolt_template_indicator: None,
         };
 
         let screen =

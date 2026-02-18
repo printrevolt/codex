@@ -1581,6 +1581,106 @@ impl App {
             AppEvent::CodexOp(op) => {
                 self.chat_widget.submit_op(op);
             }
+            AppEvent::PrintRevoltTemplatePickerChosen { choice } => {
+                self.chat_widget
+                    .on_printrevolt_template_picker_chosen(choice);
+            }
+            AppEvent::PrintRevoltTemplateReviewChosen { decision } => {
+                self.chat_widget
+                    .on_printrevolt_template_review_decision(decision);
+            }
+            AppEvent::PrintRevoltTemplatesOpenCenter => {
+                self.chat_widget.open_printrevolt_templates_center();
+            }
+            AppEvent::PrintRevoltTemplatesOpenStickyPicker => {
+                self.chat_widget.open_printrevolt_templates_sticky_picker();
+            }
+            AppEvent::PrintRevoltTemplatesOpenModePicker { scope } => {
+                self.chat_widget
+                    .open_printrevolt_templates_mode_picker(scope);
+            }
+            AppEvent::PrintRevoltTemplatesOpenDefaultPicker { scope } => {
+                self.chat_widget
+                    .open_printrevolt_templates_default_picker(scope);
+            }
+            AppEvent::PrintRevoltTemplatesConfigChangeRequested { change } => {
+                self.chat_widget
+                    .open_printrevolt_templates_config_confirm(change);
+            }
+            AppEvent::PrintRevoltPolicyOpenCenter => {
+                self.chat_widget.open_printrevolt_policy_center();
+            }
+            AppEvent::PrintRevoltPipelinesOpenCenter => {
+                self.chat_widget.open_printrevolt_pipelines_center();
+            }
+            AppEvent::PrintRevoltDispatchCommand { group, args } => {
+                self.chat_widget
+                    .on_printrevolt_dispatch_command(group, args);
+            }
+            AppEvent::PrintRevoltTemplateDraftWizardFieldSubmitted { field, value } => {
+                self.chat_widget
+                    .on_printrevolt_template_draft_wizard_field_submitted(field, value);
+            }
+            AppEvent::PrintRevoltTemplateDraftWizardStartChosen { choice } => {
+                self.chat_widget
+                    .on_printrevolt_template_draft_wizard_start_chosen(choice);
+            }
+            AppEvent::PrintRevoltTemplateDraftWizardGenerateSubmitted { prompt } => {
+                self.chat_widget
+                    .on_printrevolt_template_draft_wizard_generate_submitted(prompt);
+            }
+            AppEvent::PrintRevoltTemplateDraftWizardOpenStartMenu => {
+                self.chat_widget
+                    .open_printrevolt_template_draft_start_menu();
+            }
+            AppEvent::PrintRevoltTemplateDraftWizardOpenReview => {
+                self.chat_widget.open_printrevolt_template_draft_review();
+            }
+            AppEvent::PrintRevoltTemplateDraftWizardOpenRegeneratePrompt => {
+                self.chat_widget
+                    .open_printrevolt_template_draft_regenerate_prompt();
+            }
+            AppEvent::PrintRevoltTemplateDraftWizardRegenerateSubmitted { changes } => {
+                self.chat_widget
+                    .on_printrevolt_template_draft_wizard_regenerate_submitted(changes);
+            }
+            AppEvent::PrintRevoltTemplateDraftWizardReviewChosen { decision } => {
+                self.chat_widget
+                    .on_printrevolt_template_draft_wizard_review_decision(decision);
+            }
+            AppEvent::PrintRevoltTemplatesConfigApply { change } => {
+                self.chat_widget
+                    .on_printrevolt_templates_config_apply(change);
+            }
+            AppEvent::PrintRevoltPipelinesApplyGenerated {
+                pipeline_id,
+                pipeline_name,
+                enabled,
+                pipeline,
+            } => {
+                self.chat_widget.on_printrevolt_pipelines_apply_generated(
+                    pipeline_id,
+                    pipeline_name,
+                    enabled,
+                    pipeline,
+                );
+            }
+            AppEvent::PrintRevoltRestoreUserPrintrevoltToml { backup_path } => {
+                self.chat_widget
+                    .on_printrevolt_restore_user_printrevolt_toml(backup_path);
+            }
+            AppEvent::PrintRevoltRestoreUserPrintrevoltTomlRequested { backup_path } => {
+                self.chat_widget
+                    .on_printrevolt_restore_user_printrevolt_toml_requested(backup_path);
+            }
+            AppEvent::PrintRevoltRestoreUserPipelinesJson { backup_path } => {
+                self.chat_widget
+                    .on_printrevolt_restore_user_pipelines_json(backup_path);
+            }
+            AppEvent::PrintRevoltRestoreUserPipelinesJsonRequested { backup_path } => {
+                self.chat_widget
+                    .on_printrevolt_restore_user_pipelines_json_requested(backup_path);
+            }
             AppEvent::DiffResult(text) => {
                 // Clear the in-progress state in the bottom pane
                 self.chat_widget.on_diff_complete();

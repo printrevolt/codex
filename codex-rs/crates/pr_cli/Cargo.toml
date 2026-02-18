@@ -24,6 +24,9 @@ codex-pr-templates = { path = "../pr_templates" }
 codex-pr-types = { path = "../pr_types" }
 codex-pr-updater = { path = "../pr_updater" }
 codex-pr-advisor = { path = "../pr_advisor" }
+codex-pr-pipelines = { path = "../pr_pipelines" }
 codex-utils-home-dir = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 toml = { workspace = true }

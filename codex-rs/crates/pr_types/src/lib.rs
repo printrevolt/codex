@@ -151,6 +151,77 @@ pub mod templating {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum TemplateSelectionMode {
+    Off,
+    Once,
+    EveryTime,
+}
+
+impl Default for TemplateSelectionMode {
+    fn default() -> Self {
+        Self::Off
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TemplatesUiConfig {
+    pub selection_mode: TemplateSelectionMode,
+    /// Template id highlighted in the picker when the picker is shown.
+    /// Empty string means "none".
+    pub default_for_picker_template_id: String,
+}
+
+impl Default for TemplatesUiConfig {
+    fn default() -> Self {
+        Self {
+            selection_mode: TemplateSelectionMode::default(),
+            default_for_picker_template_id: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct TemplatesUiOverrides {
+    #[serde(default)]
+    pub selection_mode: Option<TemplateSelectionMode>,
+    #[serde(default)]
+    pub default_for_picker_template_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UiConfig {
+    /// Slash command groups disabled by a supervisor UI (e.g., Command Center).
+    /// Example values: "templates", "pipelines", "policy".
+    pub disabled_slash_commands: Vec<String>,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            disabled_slash_commands: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentConfig {
+    #[serde(default)]
+    pub templates: TemplatesUiOverrides,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            templates: TemplatesUiOverrides::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LifecycleEventKind {
     SessionStart,
     BeforeTask,
@@ -279,6 +350,7 @@ impl Default for VerifyPolicy {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PolicyConfig {
+    pub enabled: bool,
     pub deny_dangerous_always: bool,
     pub verify: VerifyPolicy,
 }
@@ -286,6 +358,7 @@ pub struct PolicyConfig {
 impl Default for PolicyConfig {
     fn default() -> Self {
         Self {
+            enabled: false,
             deny_dangerous_always: true,
             verify: VerifyPolicy::default(),
         }
@@ -463,6 +536,12 @@ pub struct PrintRevoltConfig {
     #[serde(default)]
     pub pipelines: PipelinesConfig,
     #[serde(default)]
+    pub templates: TemplatesUiConfig,
+    #[serde(default)]
+    pub ui: UiConfig,
+    #[serde(default)]
+    pub agents: BTreeMap<String, AgentConfig>,
+    #[serde(default)]
     pub vars: BTreeMap<String, String>,
 }
 
@@ -474,8 +553,28 @@ impl Default for PrintRevoltConfig {
             hooks: HookConfig::default(),
             audit: AuditConfig::default(),
             pipelines: PipelinesConfig::default(),
+            templates: TemplatesUiConfig::default(),
+            ui: UiConfig::default(),
+            agents: BTreeMap::new(),
             vars: BTreeMap::new(),
         }
+    }
+}
+
+impl PrintRevoltConfig {
+    pub fn effective_templates_ui(&self, agent_id: Option<&str>) -> TemplatesUiConfig {
+        let mut out = self.templates.clone();
+        if let Some(agent_id) = agent_id
+            && let Some(agent_cfg) = self.agents.get(agent_id)
+        {
+            if let Some(mode) = agent_cfg.templates.selection_mode {
+                out.selection_mode = mode;
+            }
+            if let Some(id) = agent_cfg.templates.default_for_picker_template_id.as_ref() {
+                out.default_for_picker_template_id = id.clone();
+            }
+        }
+        out
     }
 }
 

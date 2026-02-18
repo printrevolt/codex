@@ -25,9 +25,88 @@ use crate::history_cell::HistoryCell;
 use codex_core::features::Feature;
 use codex_core::protocol::AskForApproval;
 use codex_core::protocol::SandboxPolicy;
+use codex_pr_pipelines::Pipeline;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::config_types::Personality;
 use codex_protocol::openai_models::ReasoningEffort;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PrintRevoltTemplatePickerChoice {
+    None,
+    Template { template_id: String },
+    NewTemplate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrintRevoltTemplateReviewDecision {
+    ApproveAndSend,
+    ChangeTemplate,
+    EditPrompt,
+    Cancel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrintRevoltConfigScope {
+    Agent,
+    Global,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PrintRevoltTemplatesConfigChange {
+    SetSelectionMode {
+        scope: PrintRevoltConfigScope,
+        selection_mode: String,
+    },
+    SetDefaultForPickerTemplateId {
+        scope: PrintRevoltConfigScope,
+        template_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrintRevoltCommandGroup {
+    Templates,
+    Policy,
+    Pipelines,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrintRevoltTemplateDraftField {
+    Name,
+    Description,
+    Tags,
+    RoleObjective,
+    Procedure,
+    Outputs,
+    PolicyDefaults,
+    ToolingScope,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrintRevoltTemplateDraftStartChoice {
+    GenerateWithCodex,
+    Manual,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrintRevoltTemplateDraftSaveScope {
+    Drafts,
+    User,
+    Repo,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrintRevoltTemplateDraftReviewDecision {
+    UseOnce,
+    SaveOnly {
+        scope: PrintRevoltTemplateDraftSaveScope,
+    },
+    SaveAndUse {
+        scope: PrintRevoltTemplateDraftSaveScope,
+    },
+    Edit,
+    Cancel,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -303,6 +382,120 @@ pub(crate) enum AppEvent {
     SubmitUserMessageWithMode {
         text: String,
         collaboration_mode: CollaborationModeMask,
+    },
+
+    /// Template picker choice for a pending user submission (PrintRevolt templates UX).
+    PrintRevoltTemplatePickerChosen {
+        choice: PrintRevoltTemplatePickerChoice,
+    },
+
+    /// Review decision after previewing the generated prompt (PrintRevolt templates UX).
+    PrintRevoltTemplateReviewChosen {
+        decision: PrintRevoltTemplateReviewDecision,
+    },
+
+    /// Open the interactive Templates Center (menu) in the TUI.
+    #[allow(dead_code)]
+    PrintRevoltTemplatesOpenCenter,
+
+    /// Open a sticky-template picker (session state only).
+    PrintRevoltTemplatesOpenStickyPicker,
+
+    /// Open a selection-mode picker for the given scope.
+    PrintRevoltTemplatesOpenModePicker {
+        scope: PrintRevoltConfigScope,
+    },
+
+    /// Open a default-for-picker template chooser for the given scope.
+    PrintRevoltTemplatesOpenDefaultPicker {
+        scope: PrintRevoltConfigScope,
+    },
+
+    /// Request a reviewed config change (opens confirm UI; does not write automatically).
+    PrintRevoltTemplatesConfigChangeRequested {
+        change: PrintRevoltTemplatesConfigChange,
+    },
+
+    /// Open the interactive Policy Center (menu) in the TUI.
+    #[allow(dead_code)]
+    PrintRevoltPolicyOpenCenter,
+
+    /// Open the interactive Pipelines Center (menu) in the TUI.
+    #[allow(dead_code)]
+    PrintRevoltPipelinesOpenCenter,
+
+    /// Dispatch an internal PrintRevolt command by group with inline args (advanced fallback).
+    PrintRevoltDispatchCommand {
+        group: PrintRevoltCommandGroup,
+        args: String,
+    },
+
+    /// Field submission for the PrintRevolt new-template wizard.
+    PrintRevoltTemplateDraftWizardFieldSubmitted {
+        field: PrintRevoltTemplateDraftField,
+        value: String,
+    },
+
+    /// Start choice for the PrintRevolt new-template wizard (manual vs Codex generation).
+    PrintRevoltTemplateDraftWizardStartChosen {
+        choice: PrintRevoltTemplateDraftStartChoice,
+    },
+
+    /// Generation prompt for the PrintRevolt new-template wizard (Codex-assisted path).
+    PrintRevoltTemplateDraftWizardGenerateSubmitted {
+        prompt: String,
+    },
+
+    /// Return to the start choice step for the PrintRevolt new-template wizard.
+    PrintRevoltTemplateDraftWizardOpenStartMenu,
+
+    /// Return to the review step for the PrintRevolt new-template wizard.
+    PrintRevoltTemplateDraftWizardOpenReview,
+
+    /// Open the change-request prompt for regenerating a draft template.
+    PrintRevoltTemplateDraftWizardOpenRegeneratePrompt,
+
+    /// Change request for regenerating a draft template (Codex-assisted path).
+    PrintRevoltTemplateDraftWizardRegenerateSubmitted {
+        changes: String,
+    },
+
+    /// Decision from the PrintRevolt new-template wizard review step.
+    PrintRevoltTemplateDraftWizardReviewChosen {
+        decision: PrintRevoltTemplateDraftReviewDecision,
+    },
+
+    /// Apply a PrintRevolt templates config change (writes PrintRevolt Mode B config).
+    PrintRevoltTemplatesConfigApply {
+        change: PrintRevoltTemplatesConfigChange,
+    },
+
+    /// Apply/save a generated PrintRevolt pipeline entry to pipelines.json (with backup).
+    PrintRevoltPipelinesApplyGenerated {
+        pipeline_id: String,
+        pipeline_name: String,
+        enabled: bool,
+        pipeline: Pipeline,
+    },
+
+    /// Restore the user printrevolt.toml from a backup snapshot.
+    PrintRevoltRestoreUserPrintrevoltToml {
+        backup_path: PathBuf,
+    },
+
+    /// Request confirmation before restoring the user printrevolt.toml from a backup snapshot.
+    PrintRevoltRestoreUserPrintrevoltTomlRequested {
+        backup_path: PathBuf,
+    },
+
+    /// Restore the user pipelines.json from a backup snapshot.
+    PrintRevoltRestoreUserPipelinesJson {
+        backup_path: PathBuf,
+    },
+
+    /// Request confirmation before restoring the user pipelines.json from a backup snapshot.
+    PrintRevoltRestoreUserPipelinesJsonRequested {
+        backup_path: PathBuf,
     },
 
     /// Open the approval popup.

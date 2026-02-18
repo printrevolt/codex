@@ -145,10 +145,18 @@ use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Wrap;
+use serde::Deserialize;
+use serde::Serialize;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 use tracing::debug;
 use tracing::warn;
+
+use codex_pr_config::resolve_printrevolt_config;
+use codex_pr_templates::Template as PrintRevoltTemplate;
+use codex_pr_templates::TemplateDiscoveryConfig as PrintRevoltTemplateDiscoveryConfig;
+use sha2::Digest as _;
+use sha2::Sha256;
 
 const DEFAULT_MODEL_DISPLAY_NAME: &str = "loading";
 const PLAN_IMPLEMENTATION_TITLE: &str = "Implement this plan?";
@@ -160,6 +168,15 @@ const CONNECTORS_SELECTION_VIEW_ID: &str = "connectors-selection";
 use crate::app_event::AppEvent;
 use crate::app_event::ConnectorsSnapshot;
 use crate::app_event::ExitMode;
+use crate::app_event::PrintRevoltCommandGroup;
+use crate::app_event::PrintRevoltConfigScope;
+use crate::app_event::PrintRevoltTemplateDraftField;
+use crate::app_event::PrintRevoltTemplateDraftReviewDecision;
+use crate::app_event::PrintRevoltTemplateDraftSaveScope;
+use crate::app_event::PrintRevoltTemplateDraftStartChoice;
+use crate::app_event::PrintRevoltTemplatePickerChoice;
+use crate::app_event::PrintRevoltTemplateReviewDecision;
+use crate::app_event::PrintRevoltTemplatesConfigChange;
 #[cfg(target_os = "windows")]
 use crate::app_event::WindowsSandboxEnableMode;
 use crate::app_event::WindowsSandboxFallbackReason;
@@ -201,6 +218,7 @@ use crate::history_cell::WebSearchCell;
 use crate::key_hint;
 use crate::key_hint::KeyBinding;
 use crate::markdown::append_markdown;
+use crate::printrevolt_templates_state::TemplatesMruStore;
 use crate::render::Insets;
 use crate::render::renderable::ColumnRenderable;
 use crate::render::renderable::FlexRenderable;
@@ -620,6 +638,16 @@ pub(crate) struct ChatWidget {
     // True once we've attempted a branch lookup for the current CWD.
     status_line_branch_lookup_complete: bool,
     external_editor_state: ExternalEditorState,
+    printrevolt_config: codex_pr_types::PrintRevoltConfig,
+    printrevolt_project_root: Option<PathBuf>,
+    printrevolt_repo_trusted: bool,
+    printrevolt_disabled_slash_commands: PrintRevoltDisabledSlashCommands,
+    printrevolt_templates_mru: TemplatesMruStore,
+    printrevolt_templates_sessions: HashMap<String, TemplatesSessionState>,
+    printrevolt_pending_templates_submission: Option<PendingTemplatesSubmission>,
+    printrevolt_pending_templates_review: Option<PendingTemplatesReview>,
+    printrevolt_pending_template_draft_wizard: Option<PrintRevoltTemplateDraftWizardState>,
+    printrevolt_pending_template_generation: Option<PrintRevoltTemplateGenerationState>,
 }
 
 /// Snapshot of active-cell state that affects transcript overlay rendering.
@@ -646,11 +674,621 @@ pub(crate) struct ActiveCellTranscriptKey {
     pub(crate) animation_tick: Option<u64>,
 }
 
+#[derive(Clone, Debug)]
 pub(crate) struct UserMessage {
     text: String,
     local_images: Vec<LocalImageAttachment>,
     text_elements: Vec<TextElement>,
     mention_bindings: Vec<MentionBinding>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PrintRevoltDisabledSlashCommands {
+    templates: bool,
+    policy: bool,
+    pipelines: bool,
+}
+
+impl PrintRevoltDisabledSlashCommands {
+    fn all_disabled() -> Self {
+        Self {
+            templates: true,
+            policy: true,
+            pipelines: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct TemplatesSessionState {
+    sticky_template_id: Option<String>,
+    last_selected_template_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingTemplatesSubmission {
+    agent_id: String,
+    user_message: UserMessage,
+}
+
+#[derive(Clone, Debug)]
+struct PendingTemplatesReview {
+    agent_id: String,
+    user_message: UserMessage,
+    template_id: Option<String>,
+    template_name: Option<String>,
+    generated_prompt: String,
+    generated_prompt_sha256: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PrintRevoltTemplateDraftInput {
+    name: String,
+    description: String,
+    tags: Vec<String>,
+    role_objective: String,
+    procedure: String,
+    outputs: String,
+    policy_defaults: String,
+    tooling_scope: String,
+}
+
+#[derive(Clone, Debug)]
+struct PrintRevoltTemplateDraftWizardState {
+    pending_submission: Option<PendingTemplatesSubmission>,
+    seed_raw_prompt: String,
+    input: PrintRevoltTemplateDraftInput,
+    last_generation_prompt: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct PrintRevoltTemplateGenerationState {
+    buffer: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PrintRevoltGeneratedTemplateJson {
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    tags: Vec<String>,
+    role_objective: String,
+    procedure: String,
+    outputs: String,
+    policy_defaults: String,
+    tooling_scope: String,
+}
+
+#[derive(Clone, Debug)]
+enum PrintRevoltTemplateApplyChoice {
+    None,
+    Discovered {
+        template_id: String,
+    },
+    OneOff {
+        template_name: String,
+        contract: codex_pr_templates::TemplateContract,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct PrintRevoltPipelinesFileV1 {
+    schema_version: String,
+    #[serde(default)]
+    pipelines: BTreeMap<String, PrintRevoltPipelineEntryV1>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PrintRevoltPipelineEntryV1 {
+    id: String,
+    name: String,
+    #[serde(default = "default_true")]
+    enabled: bool,
+    pipeline: codex_pr_pipelines::Pipeline,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn parse_printrevolt_disabled_slash_commands_csv(csv: &str) -> PrintRevoltDisabledSlashCommands {
+    parse_printrevolt_disabled_slash_commands_tokens(
+        csv.split(',').map(str::trim).filter(|s| !s.is_empty()),
+    )
+}
+
+fn parse_printrevolt_disabled_slash_commands_values(
+    values: &[String],
+) -> PrintRevoltDisabledSlashCommands {
+    parse_printrevolt_disabled_slash_commands_tokens(values.iter().map(String::as_str))
+}
+
+fn parse_printrevolt_disabled_slash_commands_tokens<'a>(
+    tokens: impl IntoIterator<Item = &'a str>,
+) -> PrintRevoltDisabledSlashCommands {
+    let mut out = PrintRevoltDisabledSlashCommands::default();
+    for token in tokens {
+        match token.to_ascii_lowercase().as_str() {
+            "templates" => out.templates = true,
+            "policy" => out.policy = true,
+            "pipelines" => out.pipelines = true,
+            _ => {}
+        }
+    }
+    out
+}
+
+fn now_ms() -> u64 {
+    use std::time::SystemTime;
+    use std::time::UNIX_EPOCH;
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
+fn sha256_lower_hex(text: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    let digest = hasher.finalize();
+    to_lower_hex(digest.as_slice())
+}
+
+fn to_lower_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn yaml_double_quoted(input: &str) -> String {
+    let escaped = input.replace('\\', "\\\\").replace('\"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
+fn slugify_template_filename(name: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+    for ch in name.trim().chars() {
+        let c = ch.to_ascii_lowercase();
+        let is_ok = c.is_ascii_alphanumeric();
+        if is_ok {
+            out.push(c);
+            last_dash = false;
+            continue;
+        }
+        if !last_dash && !out.is_empty() {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.is_empty() {
+        "template".to_string()
+    } else {
+        out
+    }
+}
+
+fn default_draft_template_input(seed_raw_prompt: &str) -> PrintRevoltTemplateDraftInput {
+    let seed = seed_raw_prompt.trim();
+    let name = if seed.is_empty() {
+        "General Coding".to_string()
+    } else {
+        let first_line = seed.lines().next().unwrap_or_default().trim();
+        let mut short = first_line.to_string();
+        const MAX: usize = 48;
+        if short.len() > MAX {
+            short.truncate(MAX);
+        }
+        if short.is_empty() {
+            "General Coding".to_string()
+        } else {
+            format!("{short} (Template)")
+        }
+    };
+
+    PrintRevoltTemplateDraftInput {
+        name,
+        description: "A prompt template for consistent, structured agent work.".to_string(),
+        tags: Vec::new(),
+        role_objective: "You are a careful, security-conscious coding assistant.\nFollow repository instructions (AGENTS.md) and keep changes minimal and verifiable.".to_string(),
+        procedure: "- Understand the request and repo constraints.\n- Make the smallest correct change.\n- Run the most specific tests you can.\n- Summarize what changed and how to validate.".to_string(),
+        outputs: "- A concise explanation of changes.\n- Exact commands to validate.\n- Any follow-up suggestions (optional).".to_string(),
+        policy_defaults: "Prefer safe, non-destructive operations.\nIf verification is available, run it before finalizing.".to_string(),
+        tooling_scope: "Use local repo tools and files. Avoid network access unless explicitly requested. Do not run destructive commands.".to_string(),
+    }
+}
+
+fn draft_template_contract(
+    input: &PrintRevoltTemplateDraftInput,
+) -> codex_pr_templates::TemplateContract {
+    codex_pr_templates::TemplateContract {
+        role_objective: input.role_objective.clone(),
+        procedure: input.procedure.clone(),
+        outputs: input.outputs.clone(),
+        policy_defaults: input.policy_defaults.clone(),
+        tooling_scope: input.tooling_scope.clone(),
+    }
+}
+
+fn printrevolt_template_generation_json_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "name": { "type": "string" },
+            "description": { "type": "string" },
+            "tags": { "type": "array", "items": { "type": "string" } },
+            "role_objective": { "type": "string" },
+            "procedure": { "type": "string" },
+            "outputs": { "type": "string" },
+            "policy_defaults": { "type": "string" },
+            "tooling_scope": { "type": "string" }
+        },
+        "required": [
+            "name",
+            "role_objective",
+            "procedure",
+            "outputs",
+            "policy_defaults",
+            "tooling_scope"
+        ],
+        "additionalProperties": false
+    })
+}
+
+fn build_printrevolt_template_generation_instruction(
+    user_request: &str,
+    repo_context: String,
+) -> String {
+    let mut out = String::new();
+    out.push_str("You are generating a Codex prompt template.\n");
+    out.push_str("Return a single JSON object that matches the provided schema.\n");
+    out.push_str("Do not include markdown fences or extra keys.\n");
+    out.push_str("Do not call tools.\n\n");
+    out.push_str("User request (template intent):\n");
+    out.push_str(user_request.trim());
+    out.push_str("\n\nRepo context (bounded):\n");
+    out.push_str(repo_context.trim());
+    out.push_str("\n\nGuidance:\n");
+    out.push_str("- Keep the template reusable (not specific to one task prompt).\n");
+    out.push_str("- Use concise section text with bullets where helpful.\n");
+    out.push_str("- Emphasize safety, repo conventions (AGENTS.md), and review-before-write.\n");
+    out
+}
+
+fn render_draft_template_markdown(input: &PrintRevoltTemplateDraftInput) -> String {
+    let mut out = String::new();
+    out.push_str("---\n");
+    out.push_str("name: ");
+    out.push_str(&yaml_double_quoted(input.name.trim()));
+    out.push('\n');
+    out.push_str("description: ");
+    out.push_str(&yaml_double_quoted(input.description.trim()));
+    out.push('\n');
+    if !input.tags.is_empty() {
+        out.push_str("tags:\n");
+        for tag in &input.tags {
+            out.push_str("  - ");
+            out.push_str(&yaml_double_quoted(tag.trim()));
+            out.push('\n');
+        }
+    }
+    out.push_str("---\n\n");
+
+    out.push_str("## Role + Objective\n");
+    out.push_str(input.role_objective.trim());
+    out.push_str("\n\n");
+
+    out.push_str("## Procedure\n");
+    out.push_str(input.procedure.trim());
+    out.push_str("\n\n");
+
+    out.push_str("## Outputs\n");
+    out.push_str(input.outputs.trim());
+    out.push_str("\n\n");
+
+    out.push_str("## Policy Defaults\n");
+    out.push_str(input.policy_defaults.trim());
+    out.push_str("\n\n");
+
+    out.push_str("## Tooling Scope\n");
+    out.push_str(input.tooling_scope.trim());
+    out.push('\n');
+
+    out
+}
+
+fn find_template_by_id<'a>(
+    templates: &'a [PrintRevoltTemplate],
+    id: &str,
+) -> Option<&'a PrintRevoltTemplate> {
+    templates.iter().find(|t| t.id == id)
+}
+
+fn backup_file_if_present(target: &Path, codex_home: &Path, kind: &str) -> Option<PathBuf> {
+    if !target.exists() {
+        return None;
+    }
+    let file_name = target.file_name()?.to_string_lossy().to_string();
+    let dir = codex_home
+        .join("printrevolt")
+        .join("backups")
+        .join(kind.to_string());
+    if let Err(err) = std::fs::create_dir_all(&dir) {
+        tracing::warn!("Failed to create backup directory {}: {err}", dir.display());
+        return None;
+    }
+    let path = dir.join(format!("{}-{file_name}", now_ms()));
+    if let Err(err) = std::fs::copy(target, &path) {
+        tracing::warn!("Failed to write backup {}: {err}", path.display());
+        return None;
+    }
+    Some(path)
+}
+
+fn read_user_mode_b_printrevolt_table(target: &Path) -> Result<toml::Value, String> {
+    if !target.exists() {
+        return Ok(toml::Value::Table(toml::map::Map::new()));
+    }
+    let raw = std::fs::read_to_string(target).map_err(|err| err.to_string())?;
+    let parsed: toml::Value = toml::from_str(&raw).map_err(|err| err.to_string())?;
+    let Some(printrevolt) = parsed.get("printrevolt").cloned() else {
+        return Ok(toml::Value::Table(toml::map::Map::new()));
+    };
+    if printrevolt.is_table() {
+        Ok(printrevolt)
+    } else {
+        Err("printrevolt.toml has non-table [printrevolt] value".to_string())
+    }
+}
+
+fn user_pipelines_json_path(codex_home: &Path) -> PathBuf {
+    codex_home.join("printrevolt").join("pipelines.json")
+}
+
+fn read_user_pipelines_file(codex_home: &Path) -> Result<PrintRevoltPipelinesFileV1, String> {
+    let path = user_pipelines_json_path(codex_home);
+    if !path.exists() {
+        return Ok(PrintRevoltPipelinesFileV1 {
+            schema_version: "1".to_string(),
+            pipelines: BTreeMap::new(),
+        });
+    }
+    let raw = std::fs::read_to_string(&path).map_err(|err| err.to_string())?;
+    let parsed: PrintRevoltPipelinesFileV1 =
+        serde_json::from_str(&raw).map_err(|err| err.to_string())?;
+    Ok(parsed)
+}
+
+fn write_user_pipelines_file(
+    codex_home: &Path,
+    file: &PrintRevoltPipelinesFileV1,
+) -> Result<Option<PathBuf>, String> {
+    let path = user_pipelines_json_path(codex_home);
+    let backup = backup_file_if_present(&path, codex_home, "pipelines");
+    let parent = path
+        .parent()
+        .ok_or_else(|| "pipelines.json has no parent directory".to_string())?;
+    std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    let encoded = serde_json::to_string_pretty(file).map_err(|err| err.to_string())?;
+    std::fs::write(&path, encoded.as_bytes()).map_err(|err| err.to_string())?;
+    Ok(backup)
+}
+
+fn list_printrevolt_pipelines_backups(codex_home: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let backups_root = codex_home.join("printrevolt").join("backups");
+    for dir in ["pipelines", "pipelines_restore"] {
+        let root = backups_root.join(dir);
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_file()
+                && p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().contains("pipelines.json"))
+            {
+                out.push(p);
+            }
+        }
+    }
+    out.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+    out
+}
+
+fn apply_templates_config_change(
+    printrevolt: &mut toml::Value,
+    agent_id: &str,
+    change: &PrintRevoltTemplatesConfigChange,
+) -> Result<(), String> {
+    use toml::Value as TomlValue;
+
+    let root = ensure_toml_table(printrevolt);
+    match change {
+        PrintRevoltTemplatesConfigChange::SetSelectionMode {
+            scope,
+            selection_mode,
+        } => {
+            let mode = selection_mode.as_str();
+            if !matches!(mode, "off" | "once" | "every_time") {
+                return Err(format!("invalid selection_mode: {mode}"));
+            }
+            let templates = match scope {
+                PrintRevoltConfigScope::Global => ensure_child_table(root, "templates"),
+                PrintRevoltConfigScope::Agent => ensure_agent_templates_table(root, agent_id),
+            };
+            templates.insert(
+                "selection_mode".to_string(),
+                TomlValue::String(mode.to_string()),
+            );
+        }
+        PrintRevoltTemplatesConfigChange::SetDefaultForPickerTemplateId { scope, template_id } => {
+            let templates = match scope {
+                PrintRevoltConfigScope::Global => ensure_child_table(root, "templates"),
+                PrintRevoltConfigScope::Agent => ensure_agent_templates_table(root, agent_id),
+            };
+            templates.insert(
+                "default_for_picker_template_id".to_string(),
+                TomlValue::String(template_id.clone()),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn ensure_toml_table(value: &mut toml::Value) -> &mut toml::map::Map<String, toml::Value> {
+    if !value.is_table() {
+        *value = toml::Value::Table(toml::map::Map::new());
+    }
+    value.as_table_mut().expect("table")
+}
+
+fn ensure_child_table<'a>(
+    parent: &'a mut toml::map::Map<String, toml::Value>,
+    key: &str,
+) -> &'a mut toml::map::Map<String, toml::Value> {
+    if !parent
+        .get(key)
+        .is_some_and(|v| matches!(v, toml::Value::Table(_)))
+    {
+        parent.insert(key.to_string(), toml::Value::Table(toml::map::Map::new()));
+    }
+    parent
+        .get_mut(key)
+        .and_then(toml::Value::as_table_mut)
+        .expect("table")
+}
+
+fn ensure_agent_templates_table<'a>(
+    root: &'a mut toml::map::Map<String, toml::Value>,
+    agent_id: &str,
+) -> &'a mut toml::map::Map<String, toml::Value> {
+    let agents = ensure_child_table(root, "agents");
+    let agent = ensure_child_table(agents, agent_id);
+    ensure_child_table(agent, "templates")
+}
+
+fn parse_scope_flag(tokens: &[&str]) -> (PrintRevoltConfigScope, Option<String>) {
+    let mut scope = PrintRevoltConfigScope::Agent;
+    let mut i = 0usize;
+    while i < tokens.len() {
+        if tokens[i] == "--scope" {
+            let value = tokens.get(i + 1).copied().unwrap_or_default();
+            scope = match value {
+                "agent" => PrintRevoltConfigScope::Agent,
+                "global" => PrintRevoltConfigScope::Global,
+                "" => PrintRevoltConfigScope::Agent,
+                other => return (scope, Some(format!("invalid --scope value: {other}"))),
+            };
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    (scope, None)
+}
+
+fn normalize_selection_mode(raw: &str) -> Option<String> {
+    match raw {
+        "off" => Some("off".to_string()),
+        "once" => Some("once".to_string()),
+        "every_time" | "every-time" | "everytime" => Some("every_time".to_string()),
+        _ => None,
+    }
+}
+
+fn scope_label(scope: PrintRevoltConfigScope, agent_id: &str) -> String {
+    match scope {
+        PrintRevoltConfigScope::Agent => format!("agent ({agent_id})"),
+        PrintRevoltConfigScope::Global => "global".to_string(),
+    }
+}
+
+fn list_printrevolt_backups(codex_home: &Path) -> Vec<PathBuf> {
+    let root = codex_home.join("printrevolt").join("backups");
+    let mut out = Vec::new();
+    for dir in ["config", "restore"] {
+        let path = root.join(dir);
+        let Ok(entries) = std::fs::read_dir(&path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_file()
+                && p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().contains("printrevolt.toml"))
+            {
+                out.push(p);
+            }
+        }
+    }
+    out.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+    out
+}
+
+fn find_latest_policy_decision_in_audit(
+    codex_home: &Path,
+    prefer_non_allow: bool,
+) -> Option<serde_json::Value> {
+    use std::io::Read as _;
+    use std::io::Seek as _;
+    use std::io::SeekFrom;
+
+    let audit_root = codex_home.join("printrevolt").join("audit");
+    let mut audit_files = vec![audit_root.join("events.jsonl")];
+    for idx in 1..=3usize {
+        audit_files.push(audit_root.join(format!("events.jsonl.{idx}")));
+    }
+
+    let mut best_allow: Option<serde_json::Value> = None;
+    for path in audit_files {
+        let Ok(mut file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        let size = file.metadata().map(|m| m.len()).unwrap_or(0);
+        const MAX_BYTES: u64 = 256 * 1024;
+        if size > MAX_BYTES {
+            let _ = file.seek(SeekFrom::End(-(MAX_BYTES as i64)));
+        }
+        let mut buf = Vec::new();
+        if file.read_to_end(&mut buf).is_err() {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&buf);
+        for line in text.lines().rev().take(500) {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if v.get("kind").and_then(|k| k.as_str()) != Some("policy_decision") {
+                continue;
+            }
+            if !prefer_non_allow {
+                return Some(v);
+            }
+            let kind = v
+                .get("payload")
+                .and_then(|p| p.get("decision"))
+                .and_then(|d| d.get("kind"))
+                .and_then(|k| k.as_str())
+                .unwrap_or_default();
+            if kind != "allow" {
+                return Some(v);
+            }
+            if best_allow.is_none() {
+                best_allow = Some(v);
+            }
+        }
+    }
+    best_allow
 }
 
 impl From<String> for UserMessage {
@@ -1017,6 +1655,7 @@ impl ChatWidget {
         self.forked_from = event.forked_from_id;
         self.current_rollout_path = event.rollout_path.clone();
         self.current_cwd = Some(event.cwd.clone());
+        self.sync_printrevolt_config_and_ui();
         let initial_messages = event.initial_messages.clone();
         let forked_from_id = event.forked_from_id;
         let model_for_header = event.model.clone();
@@ -1060,6 +1699,99 @@ impl ChatWidget {
         if !self.suppress_session_configured_redraw {
             self.request_redraw();
         }
+    }
+
+    fn sync_printrevolt_config_and_ui(&mut self) {
+        let codex_home = self.config.codex_home.as_path();
+        let project_root = self.status_line_project_root();
+
+        self.printrevolt_project_root = project_root.clone();
+        let resolved = resolve_printrevolt_config(codex_home, project_root.as_deref(), None);
+        let cfg_toml = toml::to_string(&resolved.printrevolt).unwrap_or_default();
+        let cfg: codex_pr_types::PrintRevoltConfig = toml::from_str(&cfg_toml).unwrap_or_default();
+
+        self.printrevolt_repo_trusted = project_root
+            .as_ref()
+            .map(|root| root.to_string_lossy().to_string())
+            .is_some_and(|root| cfg.hooks.trusted_repo_roots.iter().any(|t| t == &root));
+
+        let disabled = if let Ok(csv) = std::env::var("PRINTREVOLT_UI_DISABLE_SLASH_COMMANDS") {
+            parse_printrevolt_disabled_slash_commands_csv(csv.as_str())
+        } else {
+            parse_printrevolt_disabled_slash_commands_values(&cfg.ui.disabled_slash_commands)
+        };
+
+        self.printrevolt_config = cfg;
+        self.printrevolt_disabled_slash_commands = if self.printrevolt_config.enabled {
+            disabled
+        } else {
+            PrintRevoltDisabledSlashCommands::all_disabled()
+        };
+
+        self.bottom_pane.set_printrevolt_disabled_slash_commands(
+            self.printrevolt_disabled_slash_commands.templates,
+            self.printrevolt_disabled_slash_commands.policy,
+            self.printrevolt_disabled_slash_commands.pipelines,
+        );
+        self.sync_printrevolt_template_indicator();
+    }
+
+    fn sync_printrevolt_template_indicator(&mut self) {
+        let agent_id = self
+            .thread_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "default".to_string());
+        let ui_cfg = self
+            .printrevolt_config
+            .effective_templates_ui(Some(agent_id.as_str()));
+        let selection_mode = if self.printrevolt_disabled_slash_commands.templates {
+            codex_pr_types::TemplateSelectionMode::Off
+        } else {
+            ui_cfg.selection_mode
+        };
+        let mode = if self.printrevolt_disabled_slash_commands.templates {
+            "disabled".to_string()
+        } else {
+            match selection_mode {
+                codex_pr_types::TemplateSelectionMode::Off => "off".to_string(),
+                codex_pr_types::TemplateSelectionMode::Once => "once".to_string(),
+                codex_pr_types::TemplateSelectionMode::EveryTime => "every_time".to_string(),
+            }
+        };
+
+        let session = self
+            .printrevolt_templates_sessions
+            .get(agent_id.as_str())
+            .cloned()
+            .unwrap_or_default();
+        let selected_id = match selection_mode {
+            codex_pr_types::TemplateSelectionMode::Off => None,
+            codex_pr_types::TemplateSelectionMode::Once => session.sticky_template_id,
+            codex_pr_types::TemplateSelectionMode::EveryTime => session.last_selected_template_id,
+        };
+        let template = if self.printrevolt_disabled_slash_commands.templates {
+            "Disabled".to_string()
+        } else if let Some(id) = selected_id {
+            let discovery = self.discover_printrevolt_templates();
+            find_template_by_id(&discovery.templates, id.as_str())
+                .map(|t| t.name.clone())
+                .unwrap_or(id)
+        } else {
+            "None".to_string()
+        };
+
+        self.bottom_pane.set_printrevolt_template_indicator(Some(
+            crate::bottom_pane::PrintRevoltTemplateIndicator { template, mode },
+        ));
+    }
+
+    fn discover_printrevolt_templates(&self) -> codex_pr_templates::TemplateDiscoveryResult {
+        codex_pr_templates::discover_templates(
+            self.config.codex_home.as_path(),
+            self.printrevolt_project_root.as_deref(),
+            self.printrevolt_repo_trusted,
+            PrintRevoltTemplateDiscoveryConfig::default(),
+        )
     }
 
     fn emit_forked_thread_event(&self, forked_from_id: ThreadId) {
@@ -1172,6 +1904,12 @@ impl ChatWidget {
     }
 
     fn on_agent_message(&mut self, message: String) {
+        if let Some(state) = self.printrevolt_pending_template_generation.as_mut() {
+            if state.buffer.trim().is_empty() && !message.trim().is_empty() {
+                state.buffer.push_str(message.as_str());
+            }
+            return;
+        }
         // If we have a stream_controller, then the final agent message is redundant and will be a
         // duplicate of what has already been streamed.
         if self.stream_controller.is_none() && !message.is_empty() {
@@ -1183,6 +1921,10 @@ impl ChatWidget {
     }
 
     fn on_agent_message_delta(&mut self, delta: String) {
+        if let Some(state) = self.printrevolt_pending_template_generation.as_mut() {
+            state.buffer.push_str(&delta);
+            return;
+        }
         self.handle_streaming_delta(delta);
     }
 
@@ -1246,6 +1988,9 @@ impl ChatWidget {
     }
 
     fn on_agent_reasoning_delta(&mut self, delta: String) {
+        if self.printrevolt_pending_template_generation.is_some() {
+            return;
+        }
         // For reasoning deltas, do not stream to history. Accumulate the
         // current reasoning block and extract the first bold element
         // (between **/**) as the chunk header. Show this header as status.
@@ -2559,6 +3304,7 @@ impl ChatWidget {
         let model = model.filter(|m| !m.trim().is_empty());
         let mut config = config;
         config.model = model.clone();
+        let printrevolt_templates_mru = TemplatesMruStore::load(config.codex_home.as_path());
         let mut rng = rand::rng();
         let placeholder = PLACEHOLDERS[rng.random_range(0..PLACEHOLDERS.len())].to_string();
         let codex_op_tx = spawn_agent(config.clone(), app_event_tx.clone(), thread_manager);
@@ -2669,6 +3415,16 @@ impl ChatWidget {
             status_line_branch_pending: false,
             status_line_branch_lookup_complete: false,
             external_editor_state: ExternalEditorState::Closed,
+            printrevolt_config: codex_pr_types::PrintRevoltConfig::default(),
+            printrevolt_project_root: None,
+            printrevolt_repo_trusted: false,
+            printrevolt_disabled_slash_commands: PrintRevoltDisabledSlashCommands::default(),
+            printrevolt_templates_mru,
+            printrevolt_templates_sessions: HashMap::new(),
+            printrevolt_pending_templates_submission: None,
+            printrevolt_pending_templates_review: None,
+            printrevolt_pending_template_draft_wizard: None,
+            printrevolt_pending_template_generation: None,
         };
 
         widget.prefetch_rate_limits();
@@ -2725,6 +3481,7 @@ impl ChatWidget {
         let model = model.filter(|m| !m.trim().is_empty());
         let mut config = config;
         config.model = model.clone();
+        let printrevolt_templates_mru = TemplatesMruStore::load(config.codex_home.as_path());
         let mut rng = rand::rng();
         let placeholder = PLACEHOLDERS[rng.random_range(0..PLACEHOLDERS.len())].to_string();
 
@@ -2834,6 +3591,16 @@ impl ChatWidget {
             status_line_branch_pending: false,
             status_line_branch_lookup_complete: false,
             external_editor_state: ExternalEditorState::Closed,
+            printrevolt_config: codex_pr_types::PrintRevoltConfig::default(),
+            printrevolt_project_root: None,
+            printrevolt_repo_trusted: false,
+            printrevolt_disabled_slash_commands: PrintRevoltDisabledSlashCommands::default(),
+            printrevolt_templates_mru,
+            printrevolt_templates_sessions: HashMap::new(),
+            printrevolt_pending_templates_submission: None,
+            printrevolt_pending_templates_review: None,
+            printrevolt_pending_template_draft_wizard: None,
+            printrevolt_pending_template_generation: None,
         };
 
         widget.prefetch_rate_limits();
@@ -2877,6 +3644,7 @@ impl ChatWidget {
             otel_manager,
         } = common;
         let model = model.filter(|m| !m.trim().is_empty());
+        let printrevolt_templates_mru = TemplatesMruStore::load(config.codex_home.as_path());
         let mut rng = rand::rng();
         let placeholder = PLACEHOLDERS[rng.random_range(0..PLACEHOLDERS.len())].to_string();
 
@@ -2988,6 +3756,16 @@ impl ChatWidget {
             status_line_branch_pending: false,
             status_line_branch_lookup_complete: false,
             external_editor_state: ExternalEditorState::Closed,
+            printrevolt_config: codex_pr_types::PrintRevoltConfig::default(),
+            printrevolt_project_root: None,
+            printrevolt_repo_trusted: false,
+            printrevolt_disabled_slash_commands: PrintRevoltDisabledSlashCommands::default(),
+            printrevolt_templates_mru,
+            printrevolt_templates_sessions: HashMap::new(),
+            printrevolt_pending_templates_submission: None,
+            printrevolt_pending_templates_review: None,
+            printrevolt_pending_template_draft_wizard: None,
+            printrevolt_pending_template_generation: None,
         };
 
         widget.prefetch_rate_limits();
@@ -3197,6 +3975,1961 @@ impl ChatWidget {
         self.request_redraw();
     }
 
+    pub(crate) fn on_printrevolt_template_picker_chosen(
+        &mut self,
+        choice: PrintRevoltTemplatePickerChoice,
+    ) {
+        let Some(pending) = self.printrevolt_pending_templates_submission.take() else {
+            return;
+        };
+        match choice {
+            PrintRevoltTemplatePickerChoice::NewTemplate => {
+                let seed_raw_prompt = pending.user_message.text.clone();
+                self.printrevolt_pending_template_draft_wizard =
+                    Some(PrintRevoltTemplateDraftWizardState {
+                        pending_submission: Some(pending),
+                        seed_raw_prompt: seed_raw_prompt.clone(),
+                        input: default_draft_template_input(seed_raw_prompt.as_str()),
+                        last_generation_prompt: None,
+                    });
+                self.open_printrevolt_template_draft_start_menu();
+            }
+            PrintRevoltTemplatePickerChoice::None => {
+                self.open_printrevolt_templates_review(
+                    pending,
+                    PrintRevoltTemplateApplyChoice::None,
+                );
+            }
+            PrintRevoltTemplatePickerChoice::Template { template_id } => {
+                self.open_printrevolt_templates_review(
+                    pending,
+                    PrintRevoltTemplateApplyChoice::Discovered { template_id },
+                );
+            }
+        }
+    }
+
+    pub(crate) fn on_printrevolt_template_review_decision(
+        &mut self,
+        decision: PrintRevoltTemplateReviewDecision,
+    ) {
+        let Some(review) = self.printrevolt_pending_templates_review.take() else {
+            return;
+        };
+        match decision {
+            PrintRevoltTemplateReviewDecision::ApproveAndSend => {
+                self.submit_user_message_with_printrevolt_template(review);
+            }
+            PrintRevoltTemplateReviewDecision::ChangeTemplate => {
+                self.printrevolt_pending_templates_submission = Some(PendingTemplatesSubmission {
+                    agent_id: review.agent_id,
+                    user_message: review.user_message,
+                });
+                self.open_printrevolt_templates_picker();
+            }
+            PrintRevoltTemplateReviewDecision::EditPrompt
+            | PrintRevoltTemplateReviewDecision::Cancel => {
+                self.restore_user_message_to_composer(review.user_message);
+                self.request_redraw();
+            }
+        }
+    }
+
+    pub(crate) fn on_printrevolt_template_draft_wizard_field_submitted(
+        &mut self,
+        field: PrintRevoltTemplateDraftField,
+        value: String,
+    ) {
+        let Some(wizard) = self.printrevolt_pending_template_draft_wizard.as_mut() else {
+            return;
+        };
+        let trimmed = value.trim().to_string();
+        match field {
+            PrintRevoltTemplateDraftField::Name => wizard.input.name = trimmed,
+            PrintRevoltTemplateDraftField::Description => wizard.input.description = trimmed,
+            PrintRevoltTemplateDraftField::Tags => {
+                wizard.input.tags = trimmed
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .map(ToString::to_string)
+                    .collect();
+            }
+            PrintRevoltTemplateDraftField::RoleObjective => wizard.input.role_objective = trimmed,
+            PrintRevoltTemplateDraftField::Procedure => wizard.input.procedure = trimmed,
+            PrintRevoltTemplateDraftField::Outputs => wizard.input.outputs = trimmed,
+            PrintRevoltTemplateDraftField::PolicyDefaults => wizard.input.policy_defaults = trimmed,
+            PrintRevoltTemplateDraftField::ToolingScope => wizard.input.tooling_scope = trimmed,
+        }
+
+        let next = match field {
+            PrintRevoltTemplateDraftField::Name => Some(PrintRevoltTemplateDraftField::Description),
+            PrintRevoltTemplateDraftField::Description => Some(PrintRevoltTemplateDraftField::Tags),
+            PrintRevoltTemplateDraftField::Tags => {
+                Some(PrintRevoltTemplateDraftField::RoleObjective)
+            }
+            PrintRevoltTemplateDraftField::RoleObjective => {
+                Some(PrintRevoltTemplateDraftField::Procedure)
+            }
+            PrintRevoltTemplateDraftField::Procedure => {
+                Some(PrintRevoltTemplateDraftField::Outputs)
+            }
+            PrintRevoltTemplateDraftField::Outputs => {
+                Some(PrintRevoltTemplateDraftField::PolicyDefaults)
+            }
+            PrintRevoltTemplateDraftField::PolicyDefaults => {
+                Some(PrintRevoltTemplateDraftField::ToolingScope)
+            }
+            PrintRevoltTemplateDraftField::ToolingScope => None,
+        };
+
+        if let Some(next) = next {
+            self.open_printrevolt_template_draft_field_prompt(next);
+        } else {
+            self.open_printrevolt_template_draft_review();
+        }
+    }
+
+    pub(crate) fn on_printrevolt_template_draft_wizard_review_decision(
+        &mut self,
+        decision: PrintRevoltTemplateDraftReviewDecision,
+    ) {
+        match decision {
+            PrintRevoltTemplateDraftReviewDecision::Cancel => {
+                let Some(wizard) = self.printrevolt_pending_template_draft_wizard.take() else {
+                    return;
+                };
+                if let Some(pending) = wizard.pending_submission {
+                    self.printrevolt_pending_templates_submission = Some(pending);
+                    self.open_printrevolt_templates_picker();
+                }
+                self.request_redraw();
+            }
+            PrintRevoltTemplateDraftReviewDecision::Edit => {
+                self.open_printrevolt_template_draft_field_prompt(
+                    PrintRevoltTemplateDraftField::Name,
+                );
+            }
+            PrintRevoltTemplateDraftReviewDecision::UseOnce => {
+                let Some(wizard) = self.printrevolt_pending_template_draft_wizard.take() else {
+                    return;
+                };
+                let Some(pending) = wizard.pending_submission else {
+                    self.add_error_message(
+                        "No pending prompt to apply this template to.".to_string(),
+                    );
+                    return;
+                };
+                let apply = PrintRevoltTemplateApplyChoice::OneOff {
+                    template_name: wizard.input.name.clone(),
+                    contract: draft_template_contract(&wizard.input),
+                };
+                self.open_printrevolt_templates_review(pending, apply);
+            }
+            PrintRevoltTemplateDraftReviewDecision::SaveOnly { scope }
+            | PrintRevoltTemplateDraftReviewDecision::SaveAndUse { scope } => {
+                let save_and_use = matches!(
+                    decision,
+                    PrintRevoltTemplateDraftReviewDecision::SaveAndUse { .. }
+                );
+                let Some(mut wizard) = self.printrevolt_pending_template_draft_wizard.take() else {
+                    return;
+                };
+                let Some((template_id, template_name, note)) =
+                    self.save_printrevolt_template_draft(&wizard.input, scope)
+                else {
+                    self.printrevolt_pending_template_draft_wizard = Some(wizard);
+                    return;
+                };
+                self.add_to_history(history_cell::new_info_event(note, None));
+
+                if save_and_use {
+                    let Some(pending) = wizard.pending_submission.take() else {
+                        self.add_error_message(
+                            "Saved template, but there is no pending prompt to apply it to."
+                                .to_string(),
+                        );
+                        return;
+                    };
+                    self.open_printrevolt_templates_review(
+                        pending,
+                        PrintRevoltTemplateApplyChoice::Discovered {
+                            template_id: template_id.clone(),
+                        },
+                    );
+                } else if let Some(pending) = wizard.pending_submission.take() {
+                    self.printrevolt_pending_templates_submission = Some(pending);
+                    self.open_printrevolt_templates_picker();
+                }
+
+                let _ = template_name;
+            }
+        }
+    }
+
+    pub(crate) fn on_printrevolt_template_draft_wizard_start_chosen(
+        &mut self,
+        choice: PrintRevoltTemplateDraftStartChoice,
+    ) {
+        match choice {
+            PrintRevoltTemplateDraftStartChoice::Manual => {
+                self.open_printrevolt_template_draft_field_prompt(
+                    PrintRevoltTemplateDraftField::Name,
+                );
+            }
+            PrintRevoltTemplateDraftStartChoice::GenerateWithCodex => {
+                self.open_printrevolt_template_draft_generate_prompt();
+            }
+        }
+    }
+
+    pub(crate) fn open_printrevolt_template_draft_start_menu(&mut self) {
+        let Some(wizard) = self.printrevolt_pending_template_draft_wizard.as_ref() else {
+            return;
+        };
+        if self.printrevolt_disabled_slash_commands.templates {
+            self.add_to_history(history_cell::new_error_event(
+                "Templates are disabled by a supervisor.".to_string(),
+            ));
+            return;
+        }
+
+        let header = Paragraph::new(
+            "Choose how to create this prompt template.\n\nNothing is saved until you confirm in the review step."
+                .to_string(),
+        )
+        .wrap(Wrap { trim: false });
+
+        let mut items: Vec<SelectionItem> = Vec::new();
+        items.push(SelectionItem {
+            name: "Generate with Codex…".to_string(),
+            description: Some(
+                "Describe what you want; Codex generates the fields (review required).".to_string(),
+            ),
+            actions: vec![Box::new(|tx| {
+                tx.send(AppEvent::PrintRevoltTemplateDraftWizardStartChosen {
+                    choice: PrintRevoltTemplateDraftStartChoice::GenerateWithCodex,
+                });
+            })],
+            dismiss_on_select: true,
+            ..Default::default()
+        });
+        items.push(SelectionItem {
+            name: "Write manually…".to_string(),
+            description: Some("Fill in fields yourself (review required).".to_string()),
+            actions: vec![Box::new(|tx| {
+                tx.send(AppEvent::PrintRevoltTemplateDraftWizardStartChosen {
+                    choice: PrintRevoltTemplateDraftStartChoice::Manual,
+                });
+            })],
+            dismiss_on_select: true,
+            ..Default::default()
+        });
+        items.push(SelectionItem {
+            name: "Cancel".to_string(),
+            description: Some("Do not save or apply.".to_string()),
+            actions: vec![Box::new(|tx| {
+                tx.send(AppEvent::PrintRevoltTemplateDraftWizardReviewChosen {
+                    decision: PrintRevoltTemplateDraftReviewDecision::Cancel,
+                });
+            })],
+            dismiss_on_select: true,
+            ..Default::default()
+        });
+
+        let seed_label = if wizard.seed_raw_prompt.trim().is_empty() {
+            "(none)".to_string()
+        } else if wizard.pending_submission.is_some() {
+            "from pending prompt".to_string()
+        } else {
+            "from composer".to_string()
+        };
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("New Prompt Template".to_string()),
+            subtitle: Some(format!("Seed: {seed_label}")),
+            header: Box::new(header),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
+        self.request_redraw();
+    }
+
+    fn open_printrevolt_template_draft_generate_prompt(&mut self) {
+        if self.printrevolt_disabled_slash_commands.templates {
+            self.add_to_history(history_cell::new_error_event(
+                "Templates are disabled by a supervisor.".to_string(),
+            ));
+            return;
+        }
+        let tx = self.app_event_tx.clone();
+        let cancel_tx = self.app_event_tx.clone();
+        let view = CustomPromptView::new_with_callbacks(
+            "Generate Prompt Template".to_string(),
+            "Describe what you want this template to do.\nThis is separate from your task prompt."
+                .to_string(),
+            Some("New Prompt Template".to_string()),
+            None,
+            false,
+            Box::new(move |value: String| {
+                tx.send(AppEvent::PrintRevoltTemplateDraftWizardGenerateSubmitted {
+                    prompt: value,
+                });
+            }),
+            Some(Box::new(move || {
+                cancel_tx.send(AppEvent::PrintRevoltTemplateDraftWizardOpenStartMenu);
+            })),
+        );
+        self.bottom_pane.show_view(Box::new(view));
+        self.request_redraw();
+    }
+
+    pub(crate) fn open_printrevolt_template_draft_regenerate_prompt(&mut self) {
+        let Some(wizard) = self.printrevolt_pending_template_draft_wizard.as_ref() else {
+            return;
+        };
+        if self.printrevolt_disabled_slash_commands.templates {
+            self.add_to_history(history_cell::new_error_event(
+                "Templates are disabled by a supervisor.".to_string(),
+            ));
+            return;
+        }
+        if wizard.last_generation_prompt.is_none() {
+            self.add_error_message(
+                "No prior Codex generation prompt to regenerate from.".to_string(),
+            );
+            return;
+        }
+        let tx = self.app_event_tx.clone();
+        let cancel_tx = self.app_event_tx.clone();
+        let view = CustomPromptView::new_with_callbacks(
+            "Regenerate Template (changes)".to_string(),
+            "Describe what to change. Codex will regenerate the template fields.\nNothing is saved until you confirm."
+                .to_string(),
+            Some("New Prompt Template".to_string()),
+            None,
+            false,
+            Box::new(move |value: String| {
+                tx.send(AppEvent::PrintRevoltTemplateDraftWizardRegenerateSubmitted { changes: value });
+            }),
+            Some(Box::new(move || {
+                cancel_tx.send(AppEvent::PrintRevoltTemplateDraftWizardOpenReview);
+            })),
+        );
+        self.bottom_pane.show_view(Box::new(view));
+        self.request_redraw();
+    }
+
+    pub(crate) fn on_printrevolt_template_draft_wizard_generate_submitted(
+        &mut self,
+        prompt: String,
+    ) {
+        self.start_printrevolt_template_generation(prompt);
+    }
+
+    pub(crate) fn on_printrevolt_template_draft_wizard_regenerate_submitted(
+        &mut self,
+        changes: String,
+    ) {
+        self.start_printrevolt_template_regeneration(changes);
+    }
+
+    fn start_printrevolt_template_generation(&mut self, prompt: String) {
+        if self.printrevolt_disabled_slash_commands.templates {
+            self.add_to_history(history_cell::new_error_event(
+                "Templates are disabled by a supervisor.".to_string(),
+            ));
+            return;
+        }
+        if self.bottom_pane.is_task_running() {
+            self.add_error_message(
+                "Cannot generate a template while a task is running.".to_string(),
+            );
+            return;
+        }
+        if self.printrevolt_pending_template_generation.is_some() {
+            self.add_error_message("Template generation is already in progress.".to_string());
+            return;
+        }
+        let prompt = prompt.trim().to_string();
+        if prompt.is_empty() {
+            self.add_error_message("Generation prompt cannot be empty.".to_string());
+            self.open_printrevolt_template_draft_generate_prompt();
+            return;
+        }
+
+        let Some(wizard) = self.printrevolt_pending_template_draft_wizard.as_mut() else {
+            return;
+        };
+        wizard.last_generation_prompt = Some(prompt.clone());
+        self.printrevolt_pending_template_generation = Some(PrintRevoltTemplateGenerationState {
+            buffer: String::new(),
+        });
+        self.add_to_history(history_cell::new_info_event(
+            "Generating template with Codex…".to_string(),
+            Some("The generated fields will be reviewed before saving or applying.".to_string()),
+        ));
+
+        let repo_context = self.printrevolt_repo_context_for_template_generation();
+        let instruction =
+            build_printrevolt_template_generation_instruction(prompt.as_str(), repo_context);
+        let schema = printrevolt_template_generation_json_schema();
+        self.submit_printrevolt_ephemeral_user_turn(instruction, schema);
+    }
+
+    fn start_printrevolt_template_regeneration(&mut self, changes: String) {
+        if self.printrevolt_disabled_slash_commands.templates {
+            self.add_to_history(history_cell::new_error_event(
+                "Templates are disabled by a supervisor.".to_string(),
+            ));
+            return;
+        }
+        if self.bottom_pane.is_task_running() {
+            self.add_error_message(
+                "Cannot regenerate a template while a task is running.".to_string(),
+            );
+            return;
+        }
+        if self.printrevolt_pending_template_generation.is_some() {
+            self.add_error_message("Template generation is already in progress.".to_string());
+            return;
+        }
+        let changes = changes.trim().to_string();
+        if changes.is_empty() {
+            self.add_error_message("Change request cannot be empty.".to_string());
+            self.open_printrevolt_template_draft_regenerate_prompt();
+            return;
+        }
+
+        let Some(wizard) = self.printrevolt_pending_template_draft_wizard.as_mut() else {
+            return;
+        };
+        let Some(base) = wizard.last_generation_prompt.clone() else {
+            self.add_error_message(
+                "No prior Codex generation prompt to regenerate from.".to_string(),
+            );
+            return;
+        };
+        let combined = format!(
+            "{base}\n\nChange request:\n{changes}\n\nRegenerate the template fields accordingly."
+        );
+        wizard.last_generation_prompt = Some(combined.clone());
+        self.printrevolt_pending_template_generation = Some(PrintRevoltTemplateGenerationState {
+            buffer: String::new(),
+        });
+        self.add_to_history(history_cell::new_info_event(
+            "Regenerating template with Codex…".to_string(),
+            Some("The regenerated fields will be reviewed before saving or applying.".to_string()),
+        ));
+
+        let repo_context = self.printrevolt_repo_context_for_template_generation();
+        let instruction =
+            build_printrevolt_template_generation_instruction(combined.as_str(), repo_context);
+        let schema = printrevolt_template_generation_json_schema();
+        self.submit_printrevolt_ephemeral_user_turn(instruction, schema);
+    }
+
+    fn submit_printrevolt_ephemeral_user_turn(&mut self, text: String, schema: serde_json::Value) {
+        let effective_mode = self.effective_collaboration_mode();
+        let collaboration_mode = if self.collaboration_modes_enabled() {
+            self.active_collaboration_mask
+                .as_ref()
+                .map(|_| effective_mode.clone())
+        } else {
+            None
+        };
+        let personality = self
+            .config
+            .personality
+            .filter(|_| self.config.features.enabled(Feature::Personality))
+            .filter(|_| self.current_model_supports_personality());
+
+        let op = Op::UserTurn {
+            items: vec![UserInput::Text {
+                text,
+                text_elements: Vec::new(),
+            }],
+            cwd: self.config.cwd.clone(),
+            approval_policy: self.config.approval_policy.value(),
+            sandbox_policy: self.config.sandbox_policy.get().clone(),
+            model: effective_mode.model().to_string(),
+            effort: effective_mode.reasoning_effort(),
+            summary: self.config.model_reasoning_summary,
+            final_output_json_schema: Some(schema),
+            collaboration_mode,
+            personality,
+        };
+        self.codex_op_tx.send(op).unwrap_or_else(|e| {
+            tracing::error!("failed to send ephemeral user turn: {e}");
+        });
+    }
+
+    fn printrevolt_repo_context_for_template_generation(&self) -> String {
+        let root = self
+            .printrevolt_project_root
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| self.config.cwd.clone());
+        let mut signals: Vec<&str> = Vec::new();
+        if root.join("Cargo.toml").exists() {
+            signals.push("rust");
+        }
+        if root.join("package.json").exists() {
+            signals.push("node");
+        }
+        if root.join("pyproject.toml").exists() {
+            signals.push("python");
+        }
+        if root.join("go.mod").exists() {
+            signals.push("go");
+        }
+
+        let mut entries: Vec<String> = Vec::new();
+        if let Ok(dir) = std::fs::read_dir(&root) {
+            for item in dir.flatten() {
+                let name = item.file_name().to_string_lossy().to_string();
+                if name == ".git" || name == "target" || name == "node_modules" {
+                    continue;
+                }
+                entries.push(name);
+                if entries.len() >= 200 {
+                    break;
+                }
+            }
+        }
+        entries.sort();
+        if entries.len() > 12 {
+            entries.truncate(12);
+        }
+
+        let signals_text = if signals.is_empty() {
+            "(unknown)".to_string()
+        } else {
+            signals.join(", ")
+        };
+        let entries_text = if entries.is_empty() {
+            "(none)".to_string()
+        } else {
+            entries.join(", ")
+        };
+        format!(
+            "Repo root: {}\nTech signals: {}\nTop-level entries: {}",
+            root.display(),
+            signals_text,
+            entries_text
+        )
+    }
+
+    fn finish_printrevolt_template_generation(&mut self, last_agent_message: Option<String>) {
+        let Some(state) = self.printrevolt_pending_template_generation.take() else {
+            return;
+        };
+        let mut raw = state.buffer;
+        if raw.trim().is_empty() {
+            raw = last_agent_message.unwrap_or_default();
+        }
+        let raw_trimmed = raw.trim();
+        if raw_trimmed.is_empty() {
+            self.add_error_message("Template generation returned empty output.".to_string());
+            self.open_printrevolt_template_draft_start_menu();
+            return;
+        }
+
+        let parsed: PrintRevoltGeneratedTemplateJson = match serde_json::from_str(raw_trimmed) {
+            Ok(v) => v,
+            Err(err) => {
+                self.add_error_message(format!("Template generation failed to parse JSON: {err}"));
+                let header = Paragraph::new(format!(
+                    "Could not parse generated JSON.\n\nError: {err}\n\nRaw output:\n{raw_trimmed}"
+                ))
+                .wrap(Wrap { trim: false });
+                let items = vec![
+                    SelectionItem {
+                        name: "Generate again…".to_string(),
+                        description: Some("Re-open the generation prompt.".to_string()),
+                        actions: vec![Box::new(|tx| {
+                            tx.send(AppEvent::PrintRevoltTemplateDraftWizardStartChosen {
+                                choice: PrintRevoltTemplateDraftStartChoice::GenerateWithCodex,
+                            });
+                        })],
+                        dismiss_on_select: true,
+                        ..Default::default()
+                    },
+                    SelectionItem {
+                        name: "Write manually…".to_string(),
+                        description: Some("Switch to manual field editing.".to_string()),
+                        actions: vec![Box::new(|tx| {
+                            tx.send(AppEvent::PrintRevoltTemplateDraftWizardStartChosen {
+                                choice: PrintRevoltTemplateDraftStartChoice::Manual,
+                            });
+                        })],
+                        dismiss_on_select: true,
+                        ..Default::default()
+                    },
+                    SelectionItem {
+                        name: "Cancel".to_string(),
+                        description: Some("Abort this template draft.".to_string()),
+                        actions: vec![Box::new(|tx| {
+                            tx.send(AppEvent::PrintRevoltTemplateDraftWizardReviewChosen {
+                                decision: PrintRevoltTemplateDraftReviewDecision::Cancel,
+                            });
+                        })],
+                        dismiss_on_select: true,
+                        ..Default::default()
+                    },
+                ];
+                self.bottom_pane.show_selection_view(SelectionViewParams {
+                    title: Some("Template generation failed".to_string()),
+                    subtitle: Some("Review output then choose next step.".to_string()),
+                    header: Box::new(header),
+                    footer_hint: Some(standard_popup_hint_line()),
+                    items,
+                    ..Default::default()
+                });
+                self.request_redraw();
+                return;
+            }
+        };
+
+        let Some(wizard) = self.printrevolt_pending_template_draft_wizard.as_mut() else {
+            self.add_error_message("Template wizard no longer active.".to_string());
+            return;
+        };
+        wizard.input = PrintRevoltTemplateDraftInput {
+            name: parsed.name.trim().to_string(),
+            description: parsed.description.trim().to_string(),
+            tags: parsed
+                .tags
+                .into_iter()
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect(),
+            role_objective: parsed.role_objective.trim().to_string(),
+            procedure: parsed.procedure.trim().to_string(),
+            outputs: parsed.outputs.trim().to_string(),
+            policy_defaults: parsed.policy_defaults.trim().to_string(),
+            tooling_scope: parsed.tooling_scope.trim().to_string(),
+        };
+        self.open_printrevolt_template_draft_review();
+    }
+
+    fn abort_printrevolt_template_generation(&mut self, reason: String) {
+        if self
+            .printrevolt_pending_template_generation
+            .take()
+            .is_none()
+        {
+            return;
+        }
+        self.add_to_history(history_cell::new_warning_event(format!(
+            "Template generation aborted: {reason}"
+        )));
+        if self.printrevolt_pending_template_draft_wizard.is_some() {
+            self.open_printrevolt_template_draft_review();
+        }
+    }
+
+    fn open_printrevolt_template_draft_field_prompt(
+        &mut self,
+        field: PrintRevoltTemplateDraftField,
+    ) {
+        let Some(wizard) = self.printrevolt_pending_template_draft_wizard.as_ref() else {
+            return;
+        };
+        let (title, placeholder, initial_text) = match field {
+            PrintRevoltTemplateDraftField::Name => (
+                "Template name".to_string(),
+                "e.g. General Coding".to_string(),
+                Some(wizard.input.name.clone()),
+            ),
+            PrintRevoltTemplateDraftField::Description => (
+                "Template description".to_string(),
+                "Short summary shown in /templates list".to_string(),
+                Some(wizard.input.description.clone()),
+            ),
+            PrintRevoltTemplateDraftField::Tags => (
+                "Template tags (optional)".to_string(),
+                "Comma-separated, e.g. security, backend".to_string(),
+                (!wizard.input.tags.is_empty()).then(|| wizard.input.tags.join(", ")),
+            ),
+            PrintRevoltTemplateDraftField::RoleObjective => (
+                "Role + Objective".to_string(),
+                "What should the assistant optimize for?".to_string(),
+                Some(wizard.input.role_objective.clone()),
+            ),
+            PrintRevoltTemplateDraftField::Procedure => (
+                "Procedure".to_string(),
+                "Preferred steps and working style.".to_string(),
+                Some(wizard.input.procedure.clone()),
+            ),
+            PrintRevoltTemplateDraftField::Outputs => (
+                "Outputs".to_string(),
+                "What should the final answer include?".to_string(),
+                Some(wizard.input.outputs.clone()),
+            ),
+            PrintRevoltTemplateDraftField::PolicyDefaults => (
+                "Policy Defaults".to_string(),
+                "What safety/verification posture should be emphasized?".to_string(),
+                Some(wizard.input.policy_defaults.clone()),
+            ),
+            PrintRevoltTemplateDraftField::ToolingScope => (
+                "Tooling Scope".to_string(),
+                "Allowed tools, limits, and boundaries.".to_string(),
+                Some(wizard.input.tooling_scope.clone()),
+            ),
+        };
+
+        let tx = self.app_event_tx.clone();
+        let cancel_tx = self.app_event_tx.clone();
+        let allow_empty_submit = matches!(field, PrintRevoltTemplateDraftField::Tags);
+        let view = CustomPromptView::new_with_callbacks(
+            title,
+            placeholder,
+            Some("New Prompt Template".to_string()),
+            initial_text,
+            allow_empty_submit,
+            Box::new(move |value: String| {
+                tx.send(AppEvent::PrintRevoltTemplateDraftWizardFieldSubmitted { field, value });
+            }),
+            Some(Box::new(move || {
+                cancel_tx.send(AppEvent::PrintRevoltTemplateDraftWizardReviewChosen {
+                    decision: PrintRevoltTemplateDraftReviewDecision::Cancel,
+                });
+            })),
+        );
+
+        self.bottom_pane.show_view(Box::new(view));
+        self.request_redraw();
+    }
+
+    pub(crate) fn open_printrevolt_template_draft_review(&mut self) {
+        let Some(wizard) = self.printrevolt_pending_template_draft_wizard.as_ref() else {
+            return;
+        };
+        let content = render_draft_template_markdown(&wizard.input);
+        let header = Paragraph::new(content).wrap(Wrap { trim: false });
+
+        let mut items: Vec<SelectionItem> = Vec::new();
+
+        if wizard.last_generation_prompt.is_some() {
+            items.push(SelectionItem {
+                name: "Regenerate with changes…".to_string(),
+                description: Some(
+                    "Ask Codex to regenerate this template (review required).".to_string(),
+                ),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::PrintRevoltTemplateDraftWizardOpenRegeneratePrompt);
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            });
+        } else {
+            items.push(SelectionItem {
+                name: "Generate with Codex…".to_string(),
+                description: Some(
+                    "Describe what you want; Codex fills in the fields (review required)."
+                        .to_string(),
+                ),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::PrintRevoltTemplateDraftWizardStartChosen {
+                        choice: PrintRevoltTemplateDraftStartChoice::GenerateWithCodex,
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            });
+        }
+
+        if wizard.pending_submission.is_some() {
+            items.push(SelectionItem {
+                name: "Use once (don’t save)".to_string(),
+                description: Some("Apply this template to the pending prompt only.".to_string()),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::PrintRevoltTemplateDraftWizardReviewChosen {
+                        decision: PrintRevoltTemplateDraftReviewDecision::UseOnce,
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            });
+        }
+
+        items.push(SelectionItem {
+            name: "Save to drafts".to_string(),
+            description: Some(
+                "Write under CODEX_HOME/printrevolt/drafts/ (discoverable as draft:...)."
+                    .to_string(),
+            ),
+            actions: vec![Box::new(|tx| {
+                tx.send(AppEvent::PrintRevoltTemplateDraftWizardReviewChosen {
+                    decision: PrintRevoltTemplateDraftReviewDecision::SaveOnly {
+                        scope: PrintRevoltTemplateDraftSaveScope::Drafts,
+                    },
+                });
+            })],
+            dismiss_on_select: true,
+            ..Default::default()
+        });
+
+        if wizard.pending_submission.is_some() {
+            items.push(SelectionItem {
+                name: "Save to drafts and use".to_string(),
+                description: Some("Write to drafts, then apply to the pending prompt.".to_string()),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::PrintRevoltTemplateDraftWizardReviewChosen {
+                        decision: PrintRevoltTemplateDraftReviewDecision::SaveAndUse {
+                            scope: PrintRevoltTemplateDraftSaveScope::Drafts,
+                        },
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            });
+        }
+
+        items.push(SelectionItem {
+            name: "Save to templates".to_string(),
+            description: Some(
+                "Write under CODEX_HOME/templates/ (discoverable as user:...).".to_string(),
+            ),
+            actions: vec![Box::new(|tx| {
+                tx.send(AppEvent::PrintRevoltTemplateDraftWizardReviewChosen {
+                    decision: PrintRevoltTemplateDraftReviewDecision::SaveOnly {
+                        scope: PrintRevoltTemplateDraftSaveScope::User,
+                    },
+                });
+            })],
+            dismiss_on_select: true,
+            ..Default::default()
+        });
+
+        if wizard.pending_submission.is_some() {
+            items.push(SelectionItem {
+                name: "Save to templates and use".to_string(),
+                description: Some(
+                    "Write to CODEX_HOME/templates, then apply to the pending prompt.".to_string(),
+                ),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::PrintRevoltTemplateDraftWizardReviewChosen {
+                        decision: PrintRevoltTemplateDraftReviewDecision::SaveAndUse {
+                            scope: PrintRevoltTemplateDraftSaveScope::User,
+                        },
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            });
+        }
+
+        if self.printrevolt_repo_trusted && self.printrevolt_project_root.is_some() {
+            items.push(SelectionItem {
+                name: "Save to repo templates".to_string(),
+                description: Some(
+                    "Write under <repo>/.codex/templates/ (discoverable as repo:...).".to_string(),
+                ),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::PrintRevoltTemplateDraftWizardReviewChosen {
+                        decision: PrintRevoltTemplateDraftReviewDecision::SaveOnly {
+                            scope: PrintRevoltTemplateDraftSaveScope::Repo,
+                        },
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            });
+
+            if wizard.pending_submission.is_some() {
+                items.push(SelectionItem {
+                    name: "Save to repo templates and use".to_string(),
+                    description: Some(
+                        "Write to repo templates, then apply to the pending prompt.".to_string(),
+                    ),
+                    actions: vec![Box::new(|tx| {
+                        tx.send(AppEvent::PrintRevoltTemplateDraftWizardReviewChosen {
+                            decision: PrintRevoltTemplateDraftReviewDecision::SaveAndUse {
+                                scope: PrintRevoltTemplateDraftSaveScope::Repo,
+                            },
+                        });
+                    })],
+                    dismiss_on_select: true,
+                    ..Default::default()
+                });
+            }
+        }
+
+        items.push(SelectionItem {
+            name: "Edit".to_string(),
+            description: Some("Go back and modify fields.".to_string()),
+            actions: vec![Box::new(|tx| {
+                tx.send(AppEvent::PrintRevoltTemplateDraftWizardReviewChosen {
+                    decision: PrintRevoltTemplateDraftReviewDecision::Edit,
+                });
+            })],
+            dismiss_on_select: true,
+            ..Default::default()
+        });
+
+        items.push(SelectionItem {
+            name: "Cancel".to_string(),
+            description: Some("Do not save or apply.".to_string()),
+            actions: vec![Box::new(|tx| {
+                tx.send(AppEvent::PrintRevoltTemplateDraftWizardReviewChosen {
+                    decision: PrintRevoltTemplateDraftReviewDecision::Cancel,
+                });
+            })],
+            dismiss_on_select: true,
+            ..Default::default()
+        });
+
+        let subtitle = format!(
+            "Seed: {}",
+            if wizard.seed_raw_prompt.trim().is_empty() {
+                "(none)"
+            } else {
+                "from current prompt"
+            }
+        );
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Review template draft".to_string()),
+            subtitle: Some(subtitle),
+            header: Box::new(header),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
+        self.request_redraw();
+    }
+
+    fn save_printrevolt_template_draft(
+        &mut self,
+        input: &PrintRevoltTemplateDraftInput,
+        scope: PrintRevoltTemplateDraftSaveScope,
+    ) -> Option<(String, String, String)> {
+        let filename = format!("{}.md", slugify_template_filename(input.name.as_str()));
+        let (root, prefix) = match scope {
+            PrintRevoltTemplateDraftSaveScope::Drafts => (
+                self.config.codex_home.join("printrevolt").join("drafts"),
+                "draft",
+            ),
+            PrintRevoltTemplateDraftSaveScope::User => {
+                (self.config.codex_home.join("templates"), "user")
+            }
+            PrintRevoltTemplateDraftSaveScope::Repo => {
+                if !self.printrevolt_repo_trusted {
+                    self.add_error_message(
+                        "Cannot save repo templates: repo not trusted.".to_string(),
+                    );
+                    return None;
+                }
+                let Some(project_root) = self.printrevolt_project_root.as_ref() else {
+                    self.add_error_message(
+                        "Cannot save repo templates: repo root not detected.".to_string(),
+                    );
+                    return None;
+                };
+                (project_root.join(".codex").join("templates"), "repo")
+            }
+        };
+
+        if let Err(err) = std::fs::create_dir_all(&root) {
+            self.add_error_message(format!(
+                "Failed to create templates directory {}: {err}",
+                root.display()
+            ));
+            return None;
+        }
+
+        let target = root.join(filename);
+        let backup = backup_file_if_present(&target, &self.config.codex_home, "template");
+        let content = render_draft_template_markdown(input);
+        if let Err(err) = std::fs::write(&target, content.as_bytes()) {
+            self.add_error_message(format!(
+                "Failed to write template {}: {err}",
+                target.display()
+            ));
+            return None;
+        }
+
+        let rel = target.strip_prefix(&root).unwrap_or(&target);
+        let id = format!("{prefix}:{}", rel.display().to_string().replace('\\', "/"));
+        let note = match backup {
+            Some(path) => format!(
+                "Saved template: {} (backup: {})",
+                target.display(),
+                path.display()
+            ),
+            None => format!("Saved template: {}", target.display()),
+        };
+        Some((id, input.name.clone(), note))
+    }
+
+    pub(crate) fn on_printrevolt_templates_config_apply(
+        &mut self,
+        change: PrintRevoltTemplatesConfigChange,
+    ) {
+        let agent_id = self
+            .thread_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "default".to_string());
+        let target = self.config.codex_home.join("printrevolt.toml");
+        let backup_path = backup_file_if_present(&target, &self.config.codex_home, "config");
+
+        let mut printrevolt_table = match read_user_mode_b_printrevolt_table(&target) {
+            Ok(v) => v,
+            Err(err) => {
+                self.add_error_message(err);
+                return;
+            }
+        };
+
+        if let Err(err) = apply_templates_config_change(&mut printrevolt_table, &agent_id, &change)
+        {
+            self.add_error_message(err);
+            return;
+        }
+
+        if let Err(err) =
+            codex_pr_config::write_mode_b_printrevolt_toml_atomic(&target, &printrevolt_table)
+        {
+            self.add_error_message(err.to_string());
+            return;
+        }
+
+        let note = match backup_path {
+            Some(path) => format!("Updated printrevolt.toml (backup: {})", path.display()),
+            None => "Updated printrevolt.toml".to_string(),
+        };
+        self.add_to_history(history_cell::new_info_event(note, None));
+        self.sync_printrevolt_config_and_ui();
+        self.request_redraw();
+    }
+
+    pub(crate) fn on_printrevolt_pipelines_apply_generated(
+        &mut self,
+        pipeline_id: String,
+        pipeline_name: String,
+        enabled: bool,
+        pipeline: codex_pr_pipelines::Pipeline,
+    ) {
+        let mut file = match read_user_pipelines_file(&self.config.codex_home) {
+            Ok(file) => file,
+            Err(err) => {
+                self.add_error_message(format!("Failed to read pipelines.json: {err}"));
+                return;
+            }
+        };
+        file.schema_version = "1".to_string();
+        file.pipelines.insert(
+            pipeline_id.clone(),
+            PrintRevoltPipelineEntryV1 {
+                id: pipeline_id.clone(),
+                name: pipeline_name,
+                enabled,
+                pipeline,
+            },
+        );
+        match write_user_pipelines_file(&self.config.codex_home, &file) {
+            Ok(backup) => {
+                let note = match backup {
+                    Some(path) => format!("Updated pipelines.json (backup: {})", path.display()),
+                    None => "Updated pipelines.json".to_string(),
+                };
+                self.add_to_history(history_cell::new_info_event(note, None));
+            }
+            Err(err) => self.add_error_message(format!("Failed to write pipelines.json: {err}")),
+        }
+        self.request_redraw();
+    }
+
+    pub(crate) fn on_printrevolt_restore_user_pipelines_json(&mut self, backup_path: PathBuf) {
+        let target = user_pipelines_json_path(&self.config.codex_home);
+        if !backup_path.exists() {
+            self.add_error_message(format!(
+                "Backup file does not exist: {}",
+                backup_path.display()
+            ));
+            return;
+        }
+
+        let _ = backup_file_if_present(&target, &self.config.codex_home, "pipelines_restore");
+        let parent = target.parent().map(Path::to_path_buf);
+        if let Some(parent) = parent {
+            if let Err(err) = std::fs::create_dir_all(&parent) {
+                self.add_error_message(err.to_string());
+                return;
+            }
+        }
+        let tmp = target.with_extension("json.tmp");
+        match std::fs::read(&backup_path)
+            .and_then(|bytes| std::fs::write(&tmp, bytes))
+            .and_then(|_| std::fs::rename(&tmp, &target))
+        {
+            Ok(()) => {
+                self.add_to_history(history_cell::new_info_event(
+                    format!("Restored pipelines.json from {}", backup_path.display()),
+                    None,
+                ));
+                self.request_redraw();
+            }
+            Err(err) => {
+                let _ = std::fs::remove_file(&tmp);
+                self.add_error_message(err.to_string());
+            }
+        }
+    }
+
+    pub(crate) fn on_printrevolt_restore_user_pipelines_json_requested(
+        &mut self,
+        backup_path: PathBuf,
+    ) {
+        let target = user_pipelines_json_path(&self.config.codex_home);
+        let header = Paragraph::new(format!(
+            "Restore {}\nfrom {}\n\nA backup of the current file will be created automatically.",
+            target.display(),
+            backup_path.display()
+        ))
+        .wrap(Wrap { trim: false });
+
+        let restore_path = backup_path.clone();
+        let items = vec![
+            SelectionItem {
+                name: "Restore".to_string(),
+                description: Some("Replace the current file with this backup.".to_string()),
+                actions: vec![Box::new(move |tx| {
+                    tx.send(AppEvent::PrintRevoltRestoreUserPipelinesJson {
+                        backup_path: restore_path.clone(),
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "Cancel".to_string(),
+                description: Some("Do not change anything.".to_string()),
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+        ];
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Restore pipelines bundle?".to_string()),
+            subtitle: None,
+            header: Box::new(header),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
+        self.request_redraw();
+    }
+
+    pub(crate) fn on_printrevolt_dispatch_command(
+        &mut self,
+        group: PrintRevoltCommandGroup,
+        args: String,
+    ) {
+        match group {
+            PrintRevoltCommandGroup::Templates => {
+                self.dispatch_printrevolt_templates_command(&args)
+            }
+            PrintRevoltCommandGroup::Policy => self.dispatch_printrevolt_policy_command(&args),
+            PrintRevoltCommandGroup::Pipelines => {
+                self.dispatch_printrevolt_pipelines_command(&args)
+            }
+        }
+        self.bottom_pane.drain_pending_submission_state();
+        self.request_redraw();
+    }
+
+    pub(crate) fn open_printrevolt_templates_center(&mut self) {
+        if self.printrevolt_disabled_slash_commands.templates {
+            self.add_to_history(history_cell::new_error_event(
+                "Templates are disabled by a supervisor.".to_string(),
+            ));
+            return;
+        }
+
+        let agent_id = self
+            .thread_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "default".to_string());
+        let ui_cfg = self
+            .printrevolt_config
+            .effective_templates_ui(Some(agent_id.as_str()));
+        let session = self
+            .printrevolt_templates_sessions
+            .get(agent_id.as_str())
+            .cloned()
+            .unwrap_or_default();
+
+        let mode = match ui_cfg.selection_mode {
+            codex_pr_types::TemplateSelectionMode::Off => "off",
+            codex_pr_types::TemplateSelectionMode::Once => "once",
+            codex_pr_types::TemplateSelectionMode::EveryTime => "every_time",
+        };
+        let sticky = session.sticky_template_id.as_deref().unwrap_or("<none>");
+        let default_id = if ui_cfg.default_for_picker_template_id.trim().is_empty() {
+            "<none>"
+        } else {
+            ui_cfg.default_for_picker_template_id.as_str()
+        };
+
+        let header = Paragraph::new(format!(
+            "Mode: {mode}\nSticky: {sticky}\nDefault for picker: {default_id}"
+        ))
+        .wrap(Wrap { trim: false });
+
+        let items = vec![
+            SelectionItem {
+                name: "Set sticky template…".to_string(),
+                description: Some("Pick a session template (no file writes).".to_string()),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::PrintRevoltTemplatesOpenStickyPicker);
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "Clear sticky template".to_string(),
+                description: Some("Clear the session sticky selection.".to_string()),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::PrintRevoltDispatchCommand {
+                        group: PrintRevoltCommandGroup::Templates,
+                        args: "clear".to_string(),
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "Selection mode (agent)…".to_string(),
+                description: Some(
+                    "Configure when template selection is prompted (writes config).".to_string(),
+                ),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::PrintRevoltTemplatesOpenModePicker {
+                        scope: PrintRevoltConfigScope::Agent,
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "Selection mode (global)…".to_string(),
+                description: Some(
+                    "Configure global default selection mode (writes config).".to_string(),
+                ),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::PrintRevoltTemplatesOpenModePicker {
+                        scope: PrintRevoltConfigScope::Global,
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "Default for picker (agent)…".to_string(),
+                description: Some(
+                    "Choose the default item shown near the top of the picker (writes config)."
+                        .to_string(),
+                ),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::PrintRevoltTemplatesOpenDefaultPicker {
+                        scope: PrintRevoltConfigScope::Agent,
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "Default for picker (global)…".to_string(),
+                description: Some(
+                    "Choose the global default-for-picker template (writes config).".to_string(),
+                ),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::PrintRevoltTemplatesOpenDefaultPicker {
+                        scope: PrintRevoltConfigScope::Global,
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "Draft new template…".to_string(),
+                description: Some(
+                    "Wizard: edit fields, review, then save or use once.".to_string(),
+                ),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::PrintRevoltDispatchCommand {
+                        group: PrintRevoltCommandGroup::Templates,
+                        args: "draft".to_string(),
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "Browse templates".to_string(),
+                description: Some("List discovered templates and sources.".to_string()),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::PrintRevoltDispatchCommand {
+                        group: PrintRevoltCommandGroup::Templates,
+                        args: "list".to_string(),
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "Validate templates".to_string(),
+                description: Some("Validate and show warnings (read-only).".to_string()),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::PrintRevoltDispatchCommand {
+                        group: PrintRevoltCommandGroup::Templates,
+                        args: "validate".to_string(),
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "Preview generated prompt".to_string(),
+                description: Some(
+                    "Show the prompt that would be sent using the selected template.".to_string(),
+                ),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::PrintRevoltDispatchCommand {
+                        group: PrintRevoltCommandGroup::Templates,
+                        args: "preview-prompt".to_string(),
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+        ];
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Templates".to_string()),
+            subtitle: Some("Navigate with ↑/↓ and press Enter.".to_string()),
+            header: Box::new(header),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
+        self.request_redraw();
+    }
+
+    pub(crate) fn open_printrevolt_templates_sticky_picker(&mut self) {
+        if self.printrevolt_disabled_slash_commands.templates {
+            self.add_to_history(history_cell::new_error_event(
+                "Templates are disabled by a supervisor.".to_string(),
+            ));
+            return;
+        }
+
+        let discovery = self.discover_printrevolt_templates();
+        let mut items = discovery
+            .templates
+            .iter()
+            .map(|t| {
+                let id = t.id.clone();
+                SelectionItem {
+                    name: t.name.clone(),
+                    description: Some(format!(
+                        "{} · {}",
+                        t.id,
+                        match t.source {
+                            codex_pr_templates::TemplateSource::Repo => "repo",
+                            codex_pr_templates::TemplateSource::User => "user",
+                            codex_pr_templates::TemplateSource::Draft => "draft",
+                        }
+                    )),
+                    search_value: Some(format!("{} {}", t.name, t.id)),
+                    actions: vec![Box::new(move |tx| {
+                        tx.send(AppEvent::PrintRevoltDispatchCommand {
+                            group: PrintRevoltCommandGroup::Templates,
+                            args: format!("use {id}"),
+                        });
+                    })],
+                    dismiss_on_select: true,
+                    ..Default::default()
+                }
+            })
+            .collect::<Vec<_>>();
+
+        if items.is_empty() {
+            items.push(SelectionItem {
+                name: "No templates found".to_string(),
+                description: Some("Create one under CODEX_HOME/templates/ or drafts.".to_string()),
+                dismiss_on_select: true,
+                ..Default::default()
+            });
+        }
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Select sticky template".to_string()),
+            subtitle: Some("Sets the session sticky template (no file writes).".to_string()),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            is_searchable: true,
+            search_placeholder: Some("Search templates…".to_string()),
+            ..Default::default()
+        });
+        self.request_redraw();
+    }
+
+    pub(crate) fn open_printrevolt_templates_mode_picker(&mut self, scope: PrintRevoltConfigScope) {
+        if self.printrevolt_disabled_slash_commands.templates {
+            self.add_to_history(history_cell::new_error_event(
+                "Templates are disabled by a supervisor.".to_string(),
+            ));
+            return;
+        }
+
+        let scope_label = scope_label(
+            scope,
+            self.thread_id
+                .as_ref()
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "default".to_string())
+                .as_str(),
+        );
+
+        let items = vec![
+            ("off", "Never prompt; send raw prompts."),
+            (
+                "once",
+                "Prompt once, then keep a sticky template until cleared.",
+            ),
+            (
+                "every_time",
+                "Prompt on every send; selection applies only to that prompt.",
+            ),
+        ]
+        .into_iter()
+        .map(|(mode, desc)| {
+            let change = PrintRevoltTemplatesConfigChange::SetSelectionMode {
+                scope,
+                selection_mode: mode.to_string(),
+            };
+            SelectionItem {
+                name: mode.to_string(),
+                description: Some(desc.to_string()),
+                actions: vec![Box::new(move |tx| {
+                    tx.send(AppEvent::PrintRevoltTemplatesConfigChangeRequested {
+                        change: change.clone(),
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            }
+        })
+        .collect::<Vec<_>>();
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Select template mode".to_string()),
+            subtitle: Some(format!("Scope: {scope_label} (review required)")),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
+        self.request_redraw();
+    }
+
+    pub(crate) fn open_printrevolt_templates_default_picker(
+        &mut self,
+        scope: PrintRevoltConfigScope,
+    ) {
+        if self.printrevolt_disabled_slash_commands.templates {
+            self.add_to_history(history_cell::new_error_event(
+                "Templates are disabled by a supervisor.".to_string(),
+            ));
+            return;
+        }
+
+        let discovery = self.discover_printrevolt_templates();
+        let agent_id = self
+            .thread_id
+            .as_ref()
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "default".to_string());
+        let scope_label = scope_label(scope, agent_id.as_str());
+
+        let mut items: Vec<SelectionItem> = Vec::new();
+        items.push(SelectionItem {
+            name: "<clear>".to_string(),
+            description: Some("Remove the default-for-picker selection.".to_string()),
+            actions: vec![Box::new(move |tx| {
+                tx.send(AppEvent::PrintRevoltTemplatesConfigChangeRequested {
+                    change: PrintRevoltTemplatesConfigChange::SetDefaultForPickerTemplateId {
+                        scope,
+                        template_id: String::new(),
+                    },
+                });
+            })],
+            dismiss_on_select: true,
+            ..Default::default()
+        });
+
+        for t in discovery.templates {
+            let id = t.id.clone();
+            let change = PrintRevoltTemplatesConfigChange::SetDefaultForPickerTemplateId {
+                scope,
+                template_id: id.clone(),
+            };
+            items.push(SelectionItem {
+                name: t.name.clone(),
+                description: Some(id.clone()),
+                search_value: Some(format!("{} {}", t.name, id)),
+                actions: vec![Box::new(move |tx| {
+                    tx.send(AppEvent::PrintRevoltTemplatesConfigChangeRequested {
+                        change: change.clone(),
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            });
+        }
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Default template for picker".to_string()),
+            subtitle: Some(format!("Scope: {scope_label} (review required)")),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            is_searchable: true,
+            search_placeholder: Some("Search templates…".to_string()),
+            ..Default::default()
+        });
+        self.request_redraw();
+    }
+
+    pub(crate) fn on_printrevolt_restore_user_printrevolt_toml(&mut self, backup_path: PathBuf) {
+        let target = self.config.codex_home.join("printrevolt.toml");
+        if !backup_path.exists() {
+            self.add_error_message(format!(
+                "Backup file does not exist: {}",
+                backup_path.display()
+            ));
+            return;
+        }
+
+        let _ = backup_file_if_present(&target, &self.config.codex_home, "restore");
+        let parent = target.parent().map(Path::to_path_buf);
+        if let Some(parent) = parent {
+            if let Err(err) = std::fs::create_dir_all(&parent) {
+                self.add_error_message(err.to_string());
+                return;
+            }
+        }
+        let tmp = target.with_extension("toml.tmp");
+        match std::fs::read(&backup_path)
+            .and_then(|bytes| std::fs::write(&tmp, bytes))
+            .and_then(|_| std::fs::rename(&tmp, &target))
+        {
+            Ok(()) => {
+                self.add_to_history(history_cell::new_info_event(
+                    format!("Restored printrevolt.toml from {}", backup_path.display()),
+                    None,
+                ));
+                self.sync_printrevolt_config_and_ui();
+                self.request_redraw();
+            }
+            Err(err) => {
+                let _ = std::fs::remove_file(&tmp);
+                self.add_error_message(err.to_string());
+            }
+        }
+    }
+
+    pub(crate) fn on_printrevolt_restore_user_printrevolt_toml_requested(
+        &mut self,
+        backup_path: PathBuf,
+    ) {
+        let target = self.config.codex_home.join("printrevolt.toml");
+        let header = Paragraph::new(format!(
+            "Restore {}\nfrom {}\n\nA backup of the current file will be created automatically.",
+            target.display(),
+            backup_path.display()
+        ))
+        .wrap(Wrap { trim: false });
+
+        let restore_path = backup_path.clone();
+        let items = vec![
+            SelectionItem {
+                name: "Restore".to_string(),
+                description: Some("Replace the current file with this backup.".to_string()),
+                actions: vec![Box::new(move |tx| {
+                    tx.send(AppEvent::PrintRevoltRestoreUserPrintrevoltToml {
+                        backup_path: restore_path.clone(),
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "Cancel".to_string(),
+                description: Some("Do not change anything.".to_string()),
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+        ];
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Restore PrintRevolt config?".to_string()),
+            subtitle: None,
+            header: Box::new(header),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
+        self.request_redraw();
+    }
+
+    fn open_printrevolt_templates_picker(&mut self) {
+        let Some(pending) = self.printrevolt_pending_templates_submission.clone() else {
+            return;
+        };
+        if self.printrevolt_disabled_slash_commands.templates {
+            self.add_to_history(history_cell::new_error_event(
+                "Templates are disabled by a supervisor.".to_string(),
+            ));
+            self.restore_user_message_to_composer(pending.user_message);
+            self.printrevolt_pending_templates_submission = None;
+            self.request_redraw();
+            return;
+        }
+
+        let discovery = self.discover_printrevolt_templates();
+        let templates = discovery.templates;
+        let agent_id = pending.agent_id.as_str();
+        let ui_cfg = self
+            .printrevolt_config
+            .effective_templates_ui(Some(agent_id));
+
+        let session = self
+            .printrevolt_templates_sessions
+            .entry(agent_id.to_string())
+            .or_default();
+        let mru_ids = self.printrevolt_templates_mru.mru_template_ids(agent_id);
+        let now_ms = now_ms();
+
+        let default_id = ui_cfg.default_for_picker_template_id.trim();
+        let default_template = (!default_id.is_empty())
+            .then(|| find_template_by_id(&templates, default_id))
+            .flatten()
+            .map(|t| (t.id.clone(), t.name.clone(), t.description.clone()));
+
+        let mut items = Vec::new();
+        items.push(SelectionItem {
+            name: "No template".to_string(),
+            description: Some("Send the raw prompt with no template.".to_string()),
+            search_value: Some("none".to_string()),
+            actions: vec![Box::new(|tx| {
+                tx.send(AppEvent::PrintRevoltTemplatePickerChosen {
+                    choice: PrintRevoltTemplatePickerChoice::None,
+                });
+            })],
+            dismiss_on_select: true,
+            ..Default::default()
+        });
+
+        if let Some((id_value, name_value, description_value)) = default_template.as_ref() {
+            let id = id_value.clone();
+            let name = format!("[default] {name_value}");
+            items.push(SelectionItem {
+                name,
+                description: (!description_value.is_empty()).then(|| description_value.clone()),
+                search_value: Some(id.clone()),
+                actions: vec![Box::new(move |tx| {
+                    tx.send(AppEvent::PrintRevoltTemplatePickerChosen {
+                        choice: PrintRevoltTemplatePickerChoice::Template {
+                            template_id: id.clone(),
+                        },
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            });
+        }
+
+        items.push(SelectionItem {
+            name: "New Prompt Template...".to_string(),
+            description: Some("Create a one-time template or save one for later.".to_string()),
+            search_value: Some("new".to_string()),
+            actions: vec![Box::new(|tx| {
+                tx.send(AppEvent::PrintRevoltTemplatePickerChosen {
+                    choice: PrintRevoltTemplatePickerChoice::NewTemplate,
+                });
+            })],
+            dismiss_on_select: true,
+            ..Default::default()
+        });
+
+        let mut picked_ids = HashSet::<String>::new();
+        if let Some((id, _, _)) = default_template.as_ref() {
+            picked_ids.insert(id.clone());
+        }
+
+        for template_id in mru_ids {
+            if picked_ids.contains(&template_id) {
+                continue;
+            }
+            let Some(t) = find_template_by_id(&templates, template_id.as_str()) else {
+                continue;
+            };
+            picked_ids.insert(t.id.clone());
+            let id = t.id.clone();
+            let used = self
+                .printrevolt_templates_mru
+                .last_used_at_ms(agent_id, id.as_str())
+                .and_then(|ts| crate::printrevolt_templates_state::format_used_ago(now_ms, ts));
+            let description = match used {
+                Some(used) if !t.description.is_empty() => format!("{} · {}", t.description, used),
+                Some(used) => used,
+                None => t.description.clone(),
+            };
+            items.push(SelectionItem {
+                name: t.name.clone(),
+                description: (!description.is_empty()).then_some(description),
+                search_value: Some(id.clone()),
+                actions: vec![Box::new(move |tx| {
+                    tx.send(AppEvent::PrintRevoltTemplatePickerChosen {
+                        choice: PrintRevoltTemplatePickerChoice::Template {
+                            template_id: id.clone(),
+                        },
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            });
+        }
+
+        let mut remaining = templates
+            .iter()
+            .filter(|t| !picked_ids.contains(&t.id))
+            .collect::<Vec<_>>();
+        remaining.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+        for t in remaining {
+            let id = t.id.clone();
+            let used = self
+                .printrevolt_templates_mru
+                .last_used_at_ms(agent_id, id.as_str())
+                .and_then(|ts| crate::printrevolt_templates_state::format_used_ago(now_ms, ts));
+            let description = match used {
+                Some(used) if !t.description.is_empty() => format!("{} · {}", t.description, used),
+                Some(used) => used,
+                None => t.description.clone(),
+            };
+            items.push(SelectionItem {
+                name: t.name.clone(),
+                description: (!description.is_empty()).then_some(description),
+                search_value: Some(id.clone()),
+                actions: vec![Box::new(move |tx| {
+                    tx.send(AppEvent::PrintRevoltTemplatePickerChosen {
+                        choice: PrintRevoltTemplatePickerChoice::Template {
+                            template_id: id.clone(),
+                        },
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            });
+        }
+
+        let initial_selected_idx = session
+            .last_selected_template_id
+            .as_ref()
+            .and_then(|id| {
+                items
+                    .iter()
+                    .position(|it| it.search_value.as_deref() == Some(id))
+            })
+            .or_else(|| default_template.as_ref().map(|_| 1));
+
+        let subtitle = format!(
+            "Mode: {}",
+            match ui_cfg.selection_mode {
+                codex_pr_types::TemplateSelectionMode::Off => "off",
+                codex_pr_types::TemplateSelectionMode::Once => "once",
+                codex_pr_types::TemplateSelectionMode::EveryTime => "every_time",
+            }
+        );
+
+        let footer_note = (!discovery.warnings.is_empty())
+            .then(|| Line::from(vec!["• ".dim(), discovery.warnings.join(" · ").dark_gray()]));
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Select prompt template".to_string()),
+            subtitle: Some(subtitle),
+            footer_note,
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            initial_selected_idx,
+            ..Default::default()
+        });
+        self.request_redraw();
+    }
+
+    fn open_printrevolt_templates_review(
+        &mut self,
+        pending: PendingTemplatesSubmission,
+        apply: PrintRevoltTemplateApplyChoice,
+    ) {
+        let raw_prompt = pending.user_message.text.clone();
+        let (template_id, template_name, generated_prompt) = match apply {
+            PrintRevoltTemplateApplyChoice::None => (None, None, raw_prompt.clone()),
+            PrintRevoltTemplateApplyChoice::Discovered { template_id } => {
+                let discovery = self.discover_printrevolt_templates();
+                let Some(t) = find_template_by_id(&discovery.templates, template_id.as_str())
+                else {
+                    self.add_to_history(history_cell::new_error_event(format!(
+                        "Template not found: {template_id}"
+                    )));
+                    self.printrevolt_pending_templates_submission = Some(pending);
+                    self.open_printrevolt_templates_picker();
+                    return;
+                };
+                (
+                    Some(template_id),
+                    Some(t.name.clone()),
+                    codex_pr_templates::compose_prompt(&raw_prompt, t),
+                )
+            }
+            PrintRevoltTemplateApplyChoice::OneOff {
+                template_name,
+                contract,
+            } => (
+                None,
+                Some(template_name.clone()),
+                codex_pr_templates::compose_prompt_from_contract(
+                    raw_prompt.as_str(),
+                    template_name.as_str(),
+                    &contract,
+                ),
+            ),
+        };
+
+        let generated_prompt_sha256 = sha256_lower_hex(generated_prompt.as_str());
+        self.printrevolt_pending_templates_review = Some(PendingTemplatesReview {
+            agent_id: pending.agent_id,
+            user_message: pending.user_message,
+            template_id: template_id.clone(),
+            template_name: template_name.clone(),
+            generated_prompt: generated_prompt.clone(),
+            generated_prompt_sha256: generated_prompt_sha256.clone(),
+        });
+
+        let subtitle = match (template_name.as_deref(), template_id.as_deref()) {
+            (None, _) => "Template: None".to_string(),
+            (Some(name), Some(id)) => format!("Template: {name} ({id})"),
+            (Some(name), None) => format!("Template: {name} (one-time)"),
+        };
+        let header = Paragraph::new(generated_prompt).wrap(Wrap { trim: false });
+        let footer_note = Line::from(vec!["sha256: ".dim(), generated_prompt_sha256.dark_gray()]);
+
+        let items = vec![
+            SelectionItem {
+                name: "Approve and send".to_string(),
+                description: Some("Send this generated prompt.".to_string()),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::PrintRevoltTemplateReviewChosen {
+                        decision: PrintRevoltTemplateReviewDecision::ApproveAndSend,
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "Change template".to_string(),
+                description: Some("Pick a different template.".to_string()),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::PrintRevoltTemplateReviewChosen {
+                        decision: PrintRevoltTemplateReviewDecision::ChangeTemplate,
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "Edit prompt".to_string(),
+                description: Some("Return the raw prompt to the composer.".to_string()),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::PrintRevoltTemplateReviewChosen {
+                        decision: PrintRevoltTemplateReviewDecision::EditPrompt,
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "Cancel".to_string(),
+                description: Some("Cancel and return to the composer.".to_string()),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::PrintRevoltTemplateReviewChosen {
+                        decision: PrintRevoltTemplateReviewDecision::Cancel,
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+        ];
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Review generated prompt".to_string()),
+            subtitle: Some(subtitle),
+            header: Box::new(header),
+            footer_note: Some(footer_note),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
+        self.request_redraw();
+    }
+
+    fn submit_user_message_with_printrevolt_template(&mut self, review: PendingTemplatesReview) {
+        self.bottom_pane
+            .set_composer_text(String::new(), Vec::new(), Vec::new());
+
+        let ui_cfg = self
+            .printrevolt_config
+            .effective_templates_ui(Some(review.agent_id.as_str()));
+        let session = self
+            .printrevolt_templates_sessions
+            .entry(review.agent_id.clone())
+            .or_default();
+
+        match ui_cfg.selection_mode {
+            codex_pr_types::TemplateSelectionMode::Once => {
+                session.last_selected_template_id = review.template_id.clone();
+                if let Some(id) = review.template_id.clone() {
+                    session.sticky_template_id = Some(id);
+                }
+            }
+            codex_pr_types::TemplateSelectionMode::EveryTime => {
+                session.last_selected_template_id = review.template_id.clone();
+            }
+            codex_pr_types::TemplateSelectionMode::Off => {}
+        }
+
+        if let Some(id) = review.template_id.as_ref() {
+            self.printrevolt_templates_mru
+                .note_used(review.agent_id.as_str(), id);
+            if let Err(err) = self.printrevolt_templates_mru.persist_if_dirty() {
+                tracing::warn!("Failed to persist PrintRevolt templates state: {err}");
+            }
+        }
+
+        self.dispatch_user_message_to_core_and_history(
+            review.user_message,
+            review.generated_prompt,
+            Vec::new(),
+            review.template_id,
+            review.template_name,
+            review.generated_prompt_sha256,
+        );
+        self.sync_printrevolt_template_indicator();
+    }
+
     pub(crate) fn can_launch_external_editor(&self) -> bool {
         self.bottom_pane.can_launch_external_editor()
     }
@@ -3210,6 +5943,9 @@ impl ChatWidget {
             self.add_to_history(history_cell::new_error_event(message));
             self.bottom_pane.drain_pending_submission_state();
             self.request_redraw();
+            return;
+        }
+        if self.reject_printrevolt_slash_command_if_disabled(cmd) {
             return;
         }
         match cmd {
@@ -3253,6 +5989,21 @@ impl ChatWidget {
             }
             SlashCommand::Review => {
                 self.open_review_popup();
+            }
+            SlashCommand::Templates => {
+                self.open_printrevolt_templates_center();
+                self.bottom_pane.drain_pending_submission_state();
+                self.request_redraw();
+            }
+            SlashCommand::Policy => {
+                self.open_printrevolt_policy_center();
+                self.bottom_pane.drain_pending_submission_state();
+                self.request_redraw();
+            }
+            SlashCommand::Pipelines => {
+                self.open_printrevolt_pipelines_center();
+                self.bottom_pane.drain_pending_submission_state();
+                self.request_redraw();
             }
             SlashCommand::Rename => {
                 self.otel_manager.counter("codex.thread.rename", 1, &[]);
@@ -3480,6 +6231,9 @@ impl ChatWidget {
             self.request_redraw();
             return;
         }
+        if self.reject_printrevolt_slash_command_if_disabled(cmd) {
+            return;
+        }
 
         let trimmed = args.trim();
         match cmd {
@@ -3544,8 +6298,1011 @@ impl ChatWidget {
                 });
                 self.bottom_pane.drain_pending_submission_state();
             }
+            SlashCommand::Templates => {
+                self.dispatch_printrevolt_templates_command(trimmed);
+                self.bottom_pane.drain_pending_submission_state();
+            }
+            SlashCommand::Policy => {
+                self.dispatch_printrevolt_policy_command(trimmed);
+                self.bottom_pane.drain_pending_submission_state();
+            }
+            SlashCommand::Pipelines => {
+                self.dispatch_printrevolt_pipelines_command(trimmed);
+                self.bottom_pane.drain_pending_submission_state();
+            }
             _ => self.dispatch_command(cmd),
         }
+    }
+
+    fn dispatch_printrevolt_templates_command(&mut self, args: &str) {
+        if self.printrevolt_disabled_slash_commands.templates {
+            self.add_to_history(history_cell::new_error_event(
+                "Templates are disabled by a supervisor.".to_string(),
+            ));
+            return;
+        }
+
+        let agent_id = self
+            .thread_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "default".to_string());
+        let session = self
+            .printrevolt_templates_sessions
+            .get(agent_id.as_str())
+            .cloned()
+            .unwrap_or_default();
+
+        let trimmed = args.trim();
+        if trimmed.is_empty() {
+            self.open_printrevolt_templates_center();
+            return;
+        }
+
+        let tokens = trimmed.split_whitespace().collect::<Vec<_>>();
+        match tokens.as_slice() {
+            ["list"] => {
+                let discovery = self.discover_printrevolt_templates();
+                let mut items = discovery
+                    .templates
+                    .iter()
+                    .map(|t| SelectionItem {
+                        name: t.name.clone(),
+                        description: Some(format!(
+                            "{} · {}",
+                            t.id,
+                            match t.source {
+                                codex_pr_templates::TemplateSource::Repo => "repo",
+                                codex_pr_templates::TemplateSource::User => "user",
+                                codex_pr_templates::TemplateSource::Draft => "draft",
+                            }
+                        )),
+                        search_value: Some(format!("{} {}", t.name, t.id)),
+                        dismiss_on_select: true,
+                        ..Default::default()
+                    })
+                    .collect::<Vec<_>>();
+                if items.is_empty() {
+                    items.push(SelectionItem {
+                        name: "No templates found".to_string(),
+                        description: Some("Create one under CODEX_HOME/templates/".to_string()),
+                        dismiss_on_select: true,
+                        ..Default::default()
+                    });
+                }
+                let footer_note = (!discovery.warnings.is_empty()).then(|| {
+                    Line::from(vec!["• ".dim(), discovery.warnings.join(" · ").dark_gray()])
+                });
+                self.bottom_pane.show_selection_view(SelectionViewParams {
+                    title: Some("Templates".to_string()),
+                    subtitle: Some("Use /templates use <id> to set sticky.".to_string()),
+                    footer_note,
+                    footer_hint: Some(standard_popup_hint_line()),
+                    items,
+                    is_searchable: true,
+                    search_placeholder: Some("Search templates…".to_string()),
+                    ..Default::default()
+                });
+            }
+            ["validate"] => {
+                let discovery = self.discover_printrevolt_templates();
+                if discovery.warnings.is_empty() {
+                    self.add_to_history(history_cell::new_info_event(
+                        "Templates: ok".to_string(),
+                        None,
+                    ));
+                } else {
+                    self.add_plain_history_lines(
+                        discovery
+                            .warnings
+                            .into_iter()
+                            .map(|w| vec!["• ".dim(), w.dark_gray()].into())
+                            .collect(),
+                    );
+                }
+            }
+            ["draft"] => {
+                let seed_raw_prompt = self.composer_text_with_pending();
+                self.printrevolt_pending_template_draft_wizard =
+                    Some(PrintRevoltTemplateDraftWizardState {
+                        pending_submission: None,
+                        seed_raw_prompt: seed_raw_prompt.clone(),
+                        input: default_draft_template_input(seed_raw_prompt.as_str()),
+                        last_generation_prompt: None,
+                    });
+                self.open_printrevolt_template_draft_start_menu();
+            }
+            ["current"] => {
+                self.dispatch_printrevolt_templates_command("");
+            }
+            ["use", template_id] => {
+                let discovery = self.discover_printrevolt_templates();
+                if find_template_by_id(&discovery.templates, template_id).is_none() {
+                    self.add_error_message(format!("Template not found: {template_id}"));
+                    return;
+                }
+                let session = self
+                    .printrevolt_templates_sessions
+                    .entry(agent_id)
+                    .or_default();
+                session.sticky_template_id = Some((*template_id).to_string());
+                session.last_selected_template_id = Some((*template_id).to_string());
+                self.add_to_history(history_cell::new_info_event(
+                    format!("Sticky template set: {template_id}"),
+                    None,
+                ));
+                self.sync_printrevolt_template_indicator();
+            }
+            ["clear"] => {
+                let session = self
+                    .printrevolt_templates_sessions
+                    .entry(agent_id)
+                    .or_default();
+                session.sticky_template_id = None;
+                self.add_to_history(history_cell::new_info_event(
+                    "Sticky template cleared.".to_string(),
+                    None,
+                ));
+                self.sync_printrevolt_template_indicator();
+            }
+            ["mode", mode, rest @ ..] => {
+                let (scope, err) = parse_scope_flag(rest);
+                if let Some(err) = err {
+                    self.add_error_message(err);
+                    return;
+                }
+                let Some(mode) = normalize_selection_mode(mode) else {
+                    self.add_error_message(format!("Invalid mode: {mode}"));
+                    return;
+                };
+                let change = PrintRevoltTemplatesConfigChange::SetSelectionMode {
+                    scope,
+                    selection_mode: mode,
+                };
+                self.open_printrevolt_templates_config_confirm(change);
+            }
+            ["default", "set", template_id, rest @ ..] => {
+                let discovery = self.discover_printrevolt_templates();
+                if find_template_by_id(&discovery.templates, template_id).is_none() {
+                    self.add_error_message(format!("Template not found: {template_id}"));
+                    return;
+                }
+                let (scope, err) = parse_scope_flag(rest);
+                if let Some(err) = err {
+                    self.add_error_message(err);
+                    return;
+                }
+                let change = PrintRevoltTemplatesConfigChange::SetDefaultForPickerTemplateId {
+                    scope,
+                    template_id: (*template_id).to_string(),
+                };
+                self.open_printrevolt_templates_config_confirm(change);
+            }
+            ["default", "clear", rest @ ..] => {
+                let (scope, err) = parse_scope_flag(rest);
+                if let Some(err) = err {
+                    self.add_error_message(err);
+                    return;
+                }
+                let change = PrintRevoltTemplatesConfigChange::SetDefaultForPickerTemplateId {
+                    scope,
+                    template_id: String::new(),
+                };
+                self.open_printrevolt_templates_config_confirm(change);
+            }
+            ["preview", template_id] => {
+                let discovery = self.discover_printrevolt_templates();
+                let Some(t) = find_template_by_id(&discovery.templates, template_id) else {
+                    self.add_error_message(format!("Template not found: {template_id}"));
+                    return;
+                };
+                let header = Paragraph::new(t.body_markdown.clone()).wrap(Wrap { trim: false });
+                self.bottom_pane.show_selection_view(SelectionViewParams {
+                    title: Some("Template preview".to_string()),
+                    subtitle: Some(format!("{} ({})", t.name, t.id)),
+                    header: Box::new(header),
+                    footer_hint: Some(standard_popup_hint_line()),
+                    items: vec![SelectionItem {
+                        name: "Close".to_string(),
+                        dismiss_on_select: true,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                });
+            }
+            ["preview-prompt"] | ["preview-prompt", ..] => {
+                let explicit_id = tokens.get(1).copied();
+                let template_id = explicit_id
+                    .map(str::to_string)
+                    .or_else(|| session.sticky_template_id.clone());
+                let Some(template_id) = template_id else {
+                    self.add_error_message(
+                        "No template selected. Use /templates use <id> or pass an id to /templates preview-prompt <id>."
+                            .to_string(),
+                    );
+                    return;
+                };
+                let raw_prompt = self.composer_text_with_pending().trim().to_string();
+                if raw_prompt.is_empty() {
+                    self.add_error_message(
+                        "Nothing to preview: the composer is empty. Type a prompt (or attach images) first."
+                            .to_string(),
+                    );
+                    return;
+                }
+                let discovery = self.discover_printrevolt_templates();
+                let Some(t) = find_template_by_id(&discovery.templates, template_id.as_str())
+                else {
+                    self.add_error_message(format!("Template not found: {template_id}"));
+                    return;
+                };
+                let prompt = codex_pr_templates::compose_prompt(raw_prompt.as_str(), t);
+                let sha = sha256_lower_hex(prompt.as_str());
+                let header = Paragraph::new(prompt).wrap(Wrap { trim: false });
+                self.bottom_pane.show_selection_view(SelectionViewParams {
+                    title: Some("Generated prompt preview".to_string()),
+                    subtitle: Some(format!("{} ({})", t.name, t.id)),
+                    header: Box::new(header),
+                    footer_note: Some(Line::from(vec!["sha256: ".dim(), sha.dark_gray()])),
+                    footer_hint: Some(standard_popup_hint_line()),
+                    items: vec![SelectionItem {
+                        name: "Close".to_string(),
+                        dismiss_on_select: true,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                });
+            }
+            _ => {
+                self.dispatch_printrevolt_templates_command("");
+            }
+        }
+    }
+
+    fn dispatch_printrevolt_policy_command(&mut self, args: &str) {
+        let trimmed = args.trim();
+        if trimmed.is_empty() {
+            self.open_printrevolt_policy_center();
+            return;
+        }
+        let tokens = trimmed.split_whitespace().collect::<Vec<_>>();
+        match tokens.as_slice() {
+            ["status"] => {
+                let cfg = &self.printrevolt_config;
+                let mut lines: Vec<Line<'static>> = Vec::new();
+                lines.push(
+                    vec![
+                        "• ".dim(),
+                        format!("PrintRevolt enabled: {}", cfg.enabled).into(),
+                    ]
+                    .into(),
+                );
+                lines.push(
+                    vec![
+                        "• ".dim(),
+                        format!("Repo trusted: {}", self.printrevolt_repo_trusted).into(),
+                    ]
+                    .into(),
+                );
+                lines.push(
+                    vec![
+                        "• ".dim(),
+                        format!(
+                            "deny_dangerous_always: {}",
+                            cfg.policy.deny_dangerous_always
+                        )
+                        .into(),
+                    ]
+                    .into(),
+                );
+                lines.push(
+                    vec![
+                        "• ".dim(),
+                        format!("verify.required: {}", cfg.policy.verify.required).into(),
+                    ]
+                    .into(),
+                );
+                lines.push(
+                    vec![
+                        "• ".dim(),
+                        format!("verify.max_age_ms: {}", cfg.policy.verify.max_age_ms).into(),
+                    ]
+                    .into(),
+                );
+                if let Some(v) =
+                    find_latest_policy_decision_in_audit(&self.config.codex_home, false)
+                {
+                    let kind = v
+                        .get("payload")
+                        .and_then(|p| p.get("decision"))
+                        .and_then(|d| d.get("kind"))
+                        .and_then(|k| k.as_str())
+                        .unwrap_or_default();
+                    let reason = v
+                        .get("payload")
+                        .and_then(|p| p.get("decision"))
+                        .and_then(|d| d.get("reason_code"))
+                        .and_then(|r| r.as_str())
+                        .unwrap_or("");
+                    if !kind.is_empty() {
+                        let note = if reason.is_empty() {
+                            format!("Last policy decision: {kind}")
+                        } else {
+                            format!("Last policy decision: {kind} ({reason})")
+                        };
+                        lines.push(vec!["• ".dim(), note.dark_gray()].into());
+                    }
+                }
+                self.add_plain_history_lines(lines);
+            }
+            ["why"] => {
+                let Some(v) = find_latest_policy_decision_in_audit(&self.config.codex_home, true)
+                else {
+                    self.add_to_history(history_cell::new_info_event(
+                        "No policy decisions recorded yet.".to_string(),
+                        Some("Trigger a tool call (or run a pipeline) and retry.".to_string()),
+                    ));
+                    return;
+                };
+                let decision = v.get("payload").and_then(|p| p.get("decision"));
+                let kind = decision
+                    .and_then(|d| d.get("kind"))
+                    .and_then(|k| k.as_str())
+                    .unwrap_or("unknown");
+                let reason = decision
+                    .and_then(|d| d.get("reason_code"))
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("<none>");
+                let message = decision
+                    .and_then(|d| d.get("message"))
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("");
+
+                let mut lines: Vec<Line<'static>> = Vec::new();
+                lines.push(vec!["• ".dim(), format!("Decision: {kind}").into()].into());
+                lines.push(vec!["• ".dim(), format!("Reason code: {reason}").into()].into());
+                if !message.is_empty() {
+                    lines.push(vec!["• ".dim(), format!("Message: {message}").into()].into());
+                }
+
+                let tool_call = v.get("payload").and_then(|p| p.get("tool_call"));
+                if let Some(tool_name) = tool_call
+                    .and_then(|tc| tc.get("tool_name"))
+                    .and_then(|t| t.as_str())
+                {
+                    lines.push(vec!["• ".dim(), format!("Tool: {tool_name}").dark_gray()].into());
+                }
+                if let Some(argv) = tool_call
+                    .and_then(|tc| tc.get("input"))
+                    .and_then(|i| i.get("command"))
+                    .and_then(|c| c.as_array())
+                {
+                    let rendered = argv
+                        .iter()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    if !rendered.is_empty() {
+                        lines
+                            .push(vec!["• ".dim(), format!("argv: {rendered}").dark_gray()].into());
+                    }
+                }
+
+                self.add_plain_history_lines(lines);
+            }
+            ["recommend"] => {
+                let repo_root = self.printrevolt_project_root.clone();
+                let package_json = repo_root
+                    .as_ref()
+                    .and_then(|root| std::fs::read_to_string(root.join("package.json")).ok());
+                let lockfiles = ["pnpm-lock.yaml", "yarn.lock", "package-lock.json"];
+                let present_lockfiles = repo_root
+                    .as_ref()
+                    .map(|root| {
+                        lockfiles
+                            .iter()
+                            .copied()
+                            .filter(|f| root.join(f).exists())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+
+                let existing_commands_json = std::fs::read_to_string(
+                    self.config
+                        .codex_home
+                        .join("printrevolt")
+                        .join("commands.json"),
+                )
+                .ok();
+                let existing_pipelines = std::fs::read_to_string(
+                    self.config
+                        .codex_home
+                        .join("printrevolt")
+                        .join("pipelines.json"),
+                )
+                .ok();
+
+                let bundle = codex_pr_advisor::recommend(codex_pr_advisor::AdvisorInput {
+                    repo_root: repo_root.as_deref(),
+                    package_json: package_json.as_deref(),
+                    lockfiles: &present_lockfiles,
+                    existing_commands_json: existing_commands_json.as_deref(),
+                    existing_pipelines: existing_pipelines.as_deref(),
+                });
+
+                match bundle {
+                    Ok(bundle) => {
+                        if bundle.recommendations.is_empty() {
+                            self.add_to_history(history_cell::new_info_event(
+                                "No recommendations.".to_string(),
+                                None,
+                            ));
+                            return;
+                        }
+                        let lines = bundle
+                            .recommendations
+                            .into_iter()
+                            .map(|r| {
+                                vec![
+                                    "• ".dim(),
+                                    format!("[{}] {} ({:?})", r.id, r.title, r.severity).into(),
+                                ]
+                                .into()
+                            })
+                            .collect::<Vec<_>>();
+                        self.add_plain_history_lines(lines);
+                    }
+                    Err(err) => {
+                        self.add_error_message(format!("Advisor failed: {err}"));
+                    }
+                }
+            }
+            ["apply", _id] => {
+                self.add_to_history(history_cell::new_info_event(
+                    "Applying policy recommendations is not implemented yet.".to_string(),
+                    None,
+                ));
+            }
+            ["restore"] => {
+                let backups = list_printrevolt_backups(&self.config.codex_home);
+                if backups.is_empty() {
+                    self.add_to_history(history_cell::new_info_event(
+                        "No backups found.".to_string(),
+                        None,
+                    ));
+                    return;
+                }
+                let items = backups
+                    .into_iter()
+                    .map(|path| {
+                        let name = path
+                            .file_name()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_else(|| path.display().to_string());
+                        let restore_path = path.clone();
+                        SelectionItem {
+                            name,
+                            description: Some(path.display().to_string()),
+                            actions: vec![Box::new(move |tx| {
+                                tx.send(AppEvent::PrintRevoltRestoreUserPrintrevoltTomlRequested {
+                                    backup_path: restore_path.clone(),
+                                });
+                            })],
+                            dismiss_on_select: true,
+                            ..Default::default()
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                self.bottom_pane.show_selection_view(SelectionViewParams {
+                    title: Some("Restore PrintRevolt config".to_string()),
+                    subtitle: Some("Select a backup to restore (review required).".to_string()),
+                    footer_hint: Some(standard_popup_hint_line()),
+                    items,
+                    ..Default::default()
+                });
+            }
+            _ => {
+                self.add_error_message(
+                    "Unknown /policy command. Try: /policy status|why|recommend|restore"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    pub(crate) fn open_printrevolt_policy_center(&mut self) {
+        if self.printrevolt_disabled_slash_commands.policy {
+            self.add_to_history(history_cell::new_error_event(
+                "Policy is disabled by a supervisor.".to_string(),
+            ));
+            return;
+        }
+
+        let cfg = &self.printrevolt_config;
+        let header = Paragraph::new(format!(
+            "PrintRevolt enabled: {}\nRepo trusted: {}\ndeny_dangerous_always: {}\nverify.required: {}",
+            cfg.enabled,
+            self.printrevolt_repo_trusted,
+            cfg.policy.deny_dangerous_always,
+            cfg.policy.verify.required
+        ))
+        .wrap(Wrap { trim: false });
+
+        let items = vec![
+            SelectionItem {
+                name: "Status".to_string(),
+                description: Some("Show effective policy configuration.".to_string()),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::PrintRevoltDispatchCommand {
+                        group: PrintRevoltCommandGroup::Policy,
+                        args: "status".to_string(),
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "Why was it blocked?".to_string(),
+                description: Some("Explain the last non-allow decision (best-effort).".to_string()),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::PrintRevoltDispatchCommand {
+                        group: PrintRevoltCommandGroup::Policy,
+                        args: "why".to_string(),
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "Recommendations".to_string(),
+                description: Some("Run bounded advisor scan and list suggestions.".to_string()),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::PrintRevoltDispatchCommand {
+                        group: PrintRevoltCommandGroup::Policy,
+                        args: "recommend".to_string(),
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "Restore from backup…".to_string(),
+                description: Some(
+                    "Restore printrevolt.toml from a snapshot (review required).".to_string(),
+                ),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::PrintRevoltDispatchCommand {
+                        group: PrintRevoltCommandGroup::Policy,
+                        args: "restore".to_string(),
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+        ];
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Policy".to_string()),
+            subtitle: Some("Navigate with ↑/↓ and press Enter.".to_string()),
+            header: Box::new(header),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
+        self.request_redraw();
+    }
+
+    fn dispatch_printrevolt_pipelines_command(&mut self, args: &str) {
+        if self.printrevolt_disabled_slash_commands.pipelines {
+            self.add_to_history(history_cell::new_error_event(
+                "Pipelines are disabled by a supervisor.".to_string(),
+            ));
+            return;
+        }
+
+        let trimmed = args.trim();
+        if trimmed.is_empty() {
+            self.open_printrevolt_pipelines_center();
+            return;
+        }
+
+        let tokens = trimmed.split_whitespace().collect::<Vec<_>>();
+        match tokens.as_slice() {
+            ["list"] => {
+                let file = match read_user_pipelines_file(&self.config.codex_home) {
+                    Ok(file) => file,
+                    Err(err) => {
+                        self.add_error_message(format!("Failed to read pipelines.json: {err}"));
+                        return;
+                    }
+                };
+                if file.pipelines.is_empty() {
+                    self.add_to_history(history_cell::new_info_event(
+                        "No pipelines configured.".to_string(),
+                        Some("Use /pipelines create to generate one.".to_string()),
+                    ));
+                    return;
+                }
+                let items = file
+                    .pipelines
+                    .values()
+                    .map(|p| SelectionItem {
+                        name: format!("{} ({})", p.name, p.id),
+                        description: Some(if p.enabled {
+                            "enabled".to_string()
+                        } else {
+                            "disabled".to_string()
+                        }),
+                        search_value: Some(format!("{} {}", p.id, p.name)),
+                        dismiss_on_select: true,
+                        ..Default::default()
+                    })
+                    .collect::<Vec<_>>();
+                self.bottom_pane.show_selection_view(SelectionViewParams {
+                    title: Some("Pipelines".to_string()),
+                    subtitle: Some("Use /pipelines show <id> to view a pipeline.".to_string()),
+                    footer_hint: Some(standard_popup_hint_line()),
+                    items,
+                    is_searchable: true,
+                    search_placeholder: Some("Search pipelines…".to_string()),
+                    ..Default::default()
+                });
+            }
+            ["show", id] => {
+                let file = match read_user_pipelines_file(&self.config.codex_home) {
+                    Ok(file) => file,
+                    Err(err) => {
+                        self.add_error_message(format!("Failed to read pipelines.json: {err}"));
+                        return;
+                    }
+                };
+                let Some(entry) = file.pipelines.get(*id) else {
+                    self.add_error_message(format!("Pipeline not found: {id}"));
+                    return;
+                };
+                let encoded = serde_json::to_string_pretty(entry).unwrap_or_default();
+                let header = Paragraph::new(encoded).wrap(Wrap { trim: false });
+                self.bottom_pane.show_selection_view(SelectionViewParams {
+                    title: Some("Pipeline".to_string()),
+                    subtitle: Some(format!("{} ({})", entry.name, entry.id)),
+                    header: Box::new(header),
+                    footer_hint: Some(standard_popup_hint_line()),
+                    items: vec![SelectionItem {
+                        name: "Close".to_string(),
+                        dismiss_on_select: true,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                });
+            }
+            ["create"] => {
+                let repo_root = self
+                    .printrevolt_project_root
+                    .clone()
+                    .unwrap_or_else(|| self.config.cwd.clone());
+                let lockfiles = [
+                    ("pnpm-lock.yaml", "pnpm"),
+                    ("yarn.lock", "yarn"),
+                    ("package-lock.json", "npm"),
+                ];
+                let package_manager = lockfiles
+                    .iter()
+                    .find(|(f, _)| repo_root.join(f).exists())
+                    .map(|(_, pm)| pm.to_string());
+                let package_json = std::fs::read_to_string(repo_root.join("package.json")).ok();
+
+                let mut commands: Vec<Vec<String>> = Vec::new();
+                if repo_root.join("Cargo.toml").exists() {
+                    commands.push(vec!["cargo".to_string(), "test".to_string()]);
+                }
+                if let (Some(pm), Some(pj)) = (package_manager.as_deref(), package_json.as_deref())
+                {
+                    let scripts = serde_json::from_str::<serde_json::Value>(pj)
+                        .ok()
+                        .and_then(|v| v.get("scripts").cloned());
+                    let has_script =
+                        |key: &str| scripts.as_ref().and_then(|s| s.get(key)).is_some();
+                    if has_script("lint") {
+                        commands.push(vec![pm.to_string(), "run".to_string(), "lint".to_string()]);
+                    }
+                    if has_script("test") {
+                        commands.push(vec![pm.to_string(), "run".to_string(), "test".to_string()]);
+                    } else {
+                        commands.push(vec![pm.to_string(), "test".to_string()]);
+                    }
+                    if has_script("build") {
+                        commands.push(vec![pm.to_string(), "run".to_string(), "build".to_string()]);
+                    }
+                }
+                if commands.is_empty() {
+                    commands.push(vec![
+                        "echo".to_string(),
+                        "TODO: add verify command".to_string(),
+                    ]);
+                }
+
+                let parts = commands
+                    .into_iter()
+                    .map(|argv| codex_pr_pipelines::Part::RunCommand {
+                        cwd: Some(".".to_string()),
+                        argv: Some(argv),
+                        command_id: None,
+                        timeout_ms: None,
+                        child_process_policy: codex_pr_types::ChildProcessPolicy::Inherit,
+                    })
+                    .collect::<Vec<_>>();
+
+                let mut workflows = BTreeMap::new();
+                workflows.insert(
+                    "main".to_string(),
+                    codex_pr_pipelines::Workflow {
+                        parts,
+                        finally_workflow: None,
+                    },
+                );
+                let pipeline = codex_pr_pipelines::Pipeline {
+                    workflows,
+                    entry: "main".to_string(),
+                };
+
+                let encoded = serde_json::to_string_pretty(&pipeline).unwrap_or_default();
+                let header = Paragraph::new(format!(
+                    "This generates a starter pipeline bundle entry.\n\nNOTE: Manual run and lifecycle integration are not wired yet.\n\nProposed pipeline:\n{encoded}"
+                ))
+                .wrap(Wrap { trim: false });
+
+                let apply_pipeline = pipeline.clone();
+                let items = vec![
+                    SelectionItem {
+                        name: "Save".to_string(),
+                        description: Some(
+                            "Write to CODEX_HOME/printrevolt/pipelines.json (with backup)."
+                                .to_string(),
+                        ),
+                        actions: vec![Box::new(move |tx| {
+                            tx.send(AppEvent::PrintRevoltPipelinesApplyGenerated {
+                                pipeline_id: "verify".to_string(),
+                                pipeline_name: "Verify".to_string(),
+                                enabled: true,
+                                pipeline: apply_pipeline.clone(),
+                            });
+                        })],
+                        dismiss_on_select: true,
+                        ..Default::default()
+                    },
+                    SelectionItem {
+                        name: "Cancel".to_string(),
+                        description: Some("Do not write anything.".to_string()),
+                        dismiss_on_select: true,
+                        ..Default::default()
+                    },
+                ];
+
+                self.bottom_pane.show_selection_view(SelectionViewParams {
+                    title: Some("Create pipeline".to_string()),
+                    subtitle: Some("Review before saving.".to_string()),
+                    header: Box::new(header),
+                    footer_hint: Some(standard_popup_hint_line()),
+                    items,
+                    ..Default::default()
+                });
+            }
+            ["restore"] => {
+                let backups = list_printrevolt_pipelines_backups(&self.config.codex_home);
+                if backups.is_empty() {
+                    self.add_to_history(history_cell::new_info_event(
+                        "No pipeline backups found.".to_string(),
+                        None,
+                    ));
+                    return;
+                }
+                let items = backups
+                    .into_iter()
+                    .map(|path| {
+                        let name = path
+                            .file_name()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_else(|| path.display().to_string());
+                        let restore_path = path.clone();
+                        SelectionItem {
+                            name,
+                            description: Some(path.display().to_string()),
+                            actions: vec![Box::new(move |tx| {
+                                tx.send(AppEvent::PrintRevoltRestoreUserPipelinesJsonRequested {
+                                    backup_path: restore_path.clone(),
+                                });
+                            })],
+                            dismiss_on_select: true,
+                            ..Default::default()
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                self.bottom_pane.show_selection_view(SelectionViewParams {
+                    title: Some("Restore pipelines bundle".to_string()),
+                    subtitle: Some("Select a backup to restore (review required).".to_string()),
+                    footer_hint: Some(standard_popup_hint_line()),
+                    items,
+                    ..Default::default()
+                });
+            }
+            ["status"] | ["run", ..] => {
+                self.add_to_history(history_cell::new_info_event(
+                    "Pipelines run/status are not implemented yet.".to_string(),
+                    Some("This build only supports list/show/create/restore.".to_string()),
+                ));
+            }
+            _ => self.add_error_message(
+                "Unknown /pipelines command. Try: /pipelines list|show <id>|create|restore"
+                    .to_string(),
+            ),
+        }
+    }
+
+    pub(crate) fn open_printrevolt_pipelines_center(&mut self) {
+        if self.printrevolt_disabled_slash_commands.pipelines {
+            self.add_to_history(history_cell::new_error_event(
+                "Pipelines are disabled by a supervisor.".to_string(),
+            ));
+            return;
+        }
+
+        let target = user_pipelines_json_path(&self.config.codex_home);
+        let header = Paragraph::new(format!(
+            "Bundle: {}\nRepo trusted: {}",
+            target.display(),
+            self.printrevolt_repo_trusted
+        ))
+        .wrap(Wrap { trim: false });
+
+        let items = vec![
+            SelectionItem {
+                name: "Browse pipelines".to_string(),
+                description: Some("List pipelines in the user bundle.".to_string()),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::PrintRevoltDispatchCommand {
+                        group: PrintRevoltCommandGroup::Pipelines,
+                        args: "list".to_string(),
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "Create pipeline…".to_string(),
+                description: Some(
+                    "Generate a starter verify pipeline (review required).".to_string(),
+                ),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::PrintRevoltDispatchCommand {
+                        group: PrintRevoltCommandGroup::Pipelines,
+                        args: "create".to_string(),
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "Restore from backup…".to_string(),
+                description: Some(
+                    "Restore pipelines.json from a snapshot (review required).".to_string(),
+                ),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::PrintRevoltDispatchCommand {
+                        group: PrintRevoltCommandGroup::Pipelines,
+                        args: "restore".to_string(),
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+        ];
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Pipelines".to_string()),
+            subtitle: Some("Navigate with ↑/↓ and press Enter.".to_string()),
+            header: Box::new(header),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
+        self.request_redraw();
+    }
+
+    pub(crate) fn open_printrevolt_templates_config_confirm(
+        &mut self,
+        change: PrintRevoltTemplatesConfigChange,
+    ) {
+        let agent_id = self
+            .thread_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "default".to_string());
+        let target = self.config.codex_home.join("printrevolt.toml");
+
+        let (title, body) = match &change {
+            PrintRevoltTemplatesConfigChange::SetSelectionMode {
+                scope,
+                selection_mode,
+            } => {
+                let scope_label = scope_label(*scope, agent_id.as_str());
+                (
+                    "Apply templates mode change?".to_string(),
+                    format!(
+                        "Scope: {scope_label}\nselection_mode -> {selection_mode}\n\nFile: {}",
+                        target.display()
+                    ),
+                )
+            }
+            PrintRevoltTemplatesConfigChange::SetDefaultForPickerTemplateId {
+                scope,
+                template_id,
+            } => {
+                let scope_label = scope_label(*scope, agent_id.as_str());
+                let template_id = if template_id.trim().is_empty() {
+                    "<clear>".to_string()
+                } else {
+                    template_id.clone()
+                };
+                (
+                    "Apply templates default change?".to_string(),
+                    format!(
+                        "Scope: {scope_label}\ndefault_for_picker_template_id -> {template_id}\n\nFile: {}",
+                        target.display()
+                    ),
+                )
+            }
+        };
+
+        let header = Paragraph::new(body).wrap(Wrap { trim: false });
+        let apply_change = change.clone();
+        let items = vec![
+            SelectionItem {
+                name: "Apply".to_string(),
+                description: Some("Write to printrevolt.toml (with backup).".to_string()),
+                actions: vec![Box::new(move |tx| {
+                    tx.send(AppEvent::PrintRevoltTemplatesConfigApply {
+                        change: apply_change.clone(),
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "Cancel".to_string(),
+                description: Some("Do not change anything.".to_string()),
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+        ];
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some(title),
+            subtitle: None,
+            header: Box::new(header),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
+        self.request_redraw();
+    }
+
+    fn reject_printrevolt_slash_command_if_disabled(&mut self, cmd: SlashCommand) -> bool {
+        let disabled = match cmd {
+            SlashCommand::Templates => self.printrevolt_disabled_slash_commands.templates,
+            SlashCommand::Policy => self.printrevolt_disabled_slash_commands.policy,
+            SlashCommand::Pipelines => self.printrevolt_disabled_slash_commands.pipelines,
+            _ => false,
+        };
+        if !disabled {
+            return false;
+        }
+
+        let message = format!(
+            "'/{}' is disabled by a supervisor (PRINTREVOLT_UI_DISABLE_SLASH_COMMANDS / printrevolt.ui.disabled_slash_commands).",
+            cmd.command()
+        );
+        self.add_to_history(history_cell::new_error_event(message));
+        self.bottom_pane.drain_pending_submission_state();
+        self.request_redraw();
+        true
     }
 
     fn show_rename_prompt(&mut self) {
@@ -3642,14 +7399,15 @@ impl ChatWidget {
         }
     }
 
-    fn submit_user_message(&mut self, user_message: UserMessage) {
-        if !self.is_session_configured() {
-            tracing::warn!("cannot submit user message before session is configured; queueing");
-            self.queued_user_messages.push_front(user_message);
-            self.refresh_queued_user_messages();
-            return;
-        }
-
+    fn dispatch_user_message_to_core_and_history(
+        &mut self,
+        user_message: UserMessage,
+        model_text: String,
+        model_text_elements: Vec<TextElement>,
+        template_id: Option<String>,
+        template_name: Option<String>,
+        generated_prompt_sha256: String,
+    ) {
         let UserMessage {
             text,
             local_images,
@@ -3659,35 +7417,8 @@ impl ChatWidget {
         if text.is_empty() && local_images.is_empty() {
             return;
         }
-        if !local_images.is_empty() && !self.current_model_supports_images() {
-            self.restore_blocked_image_submission(
-                text,
-                text_elements,
-                local_images,
-                mention_bindings,
-            );
-            return;
-        }
 
         let mut items: Vec<UserInput> = Vec::new();
-
-        // Special-case: "!cmd" executes a local shell command instead of sending to the model.
-        if let Some(stripped) = text.strip_prefix('!') {
-            let cmd = stripped.trim();
-            if cmd.is_empty() {
-                self.app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
-                    history_cell::new_info_event(
-                        USER_SHELL_COMMAND_HELP_TITLE.to_string(),
-                        Some(USER_SHELL_COMMAND_HELP_HINT.to_string()),
-                    ),
-                )));
-                return;
-            }
-            self.submit_op(Op::RunUserShellCommand {
-                command: cmd.to_string(),
-            });
-            return;
-        }
 
         for image in &local_images {
             items.push(UserInput::LocalImage {
@@ -3695,10 +7426,10 @@ impl ChatWidget {
             });
         }
 
-        if !text.is_empty() {
+        if !model_text.is_empty() {
             items.push(UserInput::Text {
-                text: text.clone(),
-                text_elements: text_elements.clone(),
+                text: model_text.clone(),
+                text_elements: model_text_elements,
             });
         }
 
@@ -3811,7 +7542,7 @@ impl ChatWidget {
             tracing::error!("failed to send message: {e}");
         });
 
-        // Persist the text to cross-session message history.
+        // Persist the text to cross-session message history (store raw prompt text).
         if !text.is_empty() {
             let encoded_mentions = mention_bindings
                 .iter()
@@ -3828,6 +7559,17 @@ impl ChatWidget {
                 });
         }
 
+        if let Some(name) = template_name {
+            let id = template_id.unwrap_or_default();
+            let note = if id.is_empty() {
+                format!("Using template: {name}")
+            } else {
+                format!("Using template: {name} ({id})")
+            };
+            let _ = generated_prompt_sha256;
+            self.add_to_history(history_cell::new_info_event(note, None));
+        }
+
         // Only show the text portion in conversation history.
         if !text.is_empty() {
             let local_image_paths = local_images.into_iter().map(|img| img.path).collect();
@@ -3839,6 +7581,148 @@ impl ChatWidget {
         }
 
         self.needs_final_message_separator = false;
+    }
+
+    fn submit_user_message(&mut self, user_message: UserMessage) {
+        if !self.is_session_configured() {
+            tracing::warn!("cannot submit user message before session is configured; queueing");
+            self.queued_user_messages.push_front(user_message);
+            self.refresh_queued_user_messages();
+            return;
+        }
+
+        let UserMessage {
+            text,
+            local_images,
+            text_elements,
+            mention_bindings,
+        } = user_message;
+        if text.is_empty() && local_images.is_empty() {
+            return;
+        }
+        if !local_images.is_empty() && !self.current_model_supports_images() {
+            self.restore_blocked_image_submission(
+                text,
+                text_elements,
+                local_images,
+                mention_bindings,
+            );
+            return;
+        }
+
+        // Special-case: "!cmd" executes a local shell command instead of sending to the model.
+        if let Some(stripped) = text.strip_prefix('!') {
+            let cmd = stripped.trim();
+            if cmd.is_empty() {
+                self.app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
+                    history_cell::new_info_event(
+                        USER_SHELL_COMMAND_HELP_TITLE.to_string(),
+                        Some(USER_SHELL_COMMAND_HELP_HINT.to_string()),
+                    ),
+                )));
+                return;
+            }
+            self.submit_op(Op::RunUserShellCommand {
+                command: cmd.to_string(),
+            });
+            return;
+        }
+
+        let agent_id = self
+            .thread_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "default".to_string());
+        let ui_cfg = self
+            .printrevolt_config
+            .effective_templates_ui(Some(agent_id.as_str()));
+        let selection_mode = if self.printrevolt_disabled_slash_commands.templates {
+            codex_pr_types::TemplateSelectionMode::Off
+        } else {
+            ui_cfg.selection_mode
+        };
+
+        let should_show_picker = {
+            let session = self
+                .printrevolt_templates_sessions
+                .entry(agent_id.clone())
+                .or_default();
+            match selection_mode {
+                codex_pr_types::TemplateSelectionMode::Off => false,
+                codex_pr_types::TemplateSelectionMode::Once => {
+                    session.sticky_template_id.is_none() && !text.is_empty()
+                }
+                codex_pr_types::TemplateSelectionMode::EveryTime => !text.is_empty(),
+            }
+        };
+        let raw_message = UserMessage {
+            text,
+            local_images,
+            text_elements,
+            mention_bindings,
+        };
+        if should_show_picker {
+            // Keep the user's draft visible so Esc cancels are side-effect free.
+            self.restore_user_message_to_composer(raw_message.clone());
+            self.printrevolt_pending_templates_submission = Some(PendingTemplatesSubmission {
+                agent_id,
+                user_message: raw_message,
+            });
+            self.open_printrevolt_templates_picker();
+            return;
+        }
+
+        if matches!(selection_mode, codex_pr_types::TemplateSelectionMode::Once)
+            && let Some(sticky_id) = self
+                .printrevolt_templates_sessions
+                .get(agent_id.as_str())
+                .and_then(|s| s.sticky_template_id.clone())
+        {
+            let discovery = self.discover_printrevolt_templates();
+            if let Some(t) = find_template_by_id(&discovery.templates, sticky_id.as_str()) {
+                let generated_prompt = codex_pr_templates::compose_prompt(&raw_message.text, t);
+                let sha = sha256_lower_hex(generated_prompt.as_str());
+                self.printrevolt_templates_mru
+                    .note_used(agent_id.as_str(), sticky_id.as_str());
+                let _ = self.printrevolt_templates_mru.persist_if_dirty();
+                if let Some(session) = self
+                    .printrevolt_templates_sessions
+                    .get_mut(agent_id.as_str())
+                {
+                    session.last_selected_template_id = Some(sticky_id.clone());
+                }
+                self.dispatch_user_message_to_core_and_history(
+                    raw_message,
+                    generated_prompt,
+                    Vec::new(),
+                    Some(sticky_id),
+                    Some(t.name.clone()),
+                    sha,
+                );
+                self.sync_printrevolt_template_indicator();
+                return;
+            }
+            if let Some(session) = self
+                .printrevolt_templates_sessions
+                .get_mut(agent_id.as_str())
+            {
+                session.sticky_template_id = None;
+            }
+            self.add_to_history(history_cell::new_warning_event(
+                "Sticky template not found; clearing selection.".to_string(),
+            ));
+            self.sync_printrevolt_template_indicator();
+        }
+
+        let model_text = raw_message.text.clone();
+        let model_text_elements = raw_message.text_elements.clone();
+        self.dispatch_user_message_to_core_and_history(
+            raw_message,
+            model_text,
+            model_text_elements,
+            None,
+            None,
+            String::new(),
+        );
     }
 
     /// Restore the blocked submission draft without losing mention resolution state.
@@ -3943,7 +7827,14 @@ impl ChatWidget {
             EventMsg::TurnStarted(_) => self.on_task_started(),
             EventMsg::TurnComplete(TurnCompleteEvent {
                 last_agent_message, ..
-            }) => self.on_task_complete(last_agent_message, from_replay),
+            }) => {
+                if !from_replay && self.printrevolt_pending_template_generation.is_some() {
+                    self.finish_printrevolt_template_generation(last_agent_message);
+                    self.on_task_complete(None, from_replay);
+                } else {
+                    self.on_task_complete(last_agent_message, from_replay);
+                }
+            }
             EventMsg::TokenCount(ev) => {
                 self.set_token_info(ev.info);
                 self.on_rate_limit_snapshot(ev.rate_limits);
@@ -3970,17 +7861,22 @@ impl ChatWidget {
             }
             EventMsg::McpStartupUpdate(ev) => self.on_mcp_startup_update(ev),
             EventMsg::McpStartupComplete(ev) => self.on_mcp_startup_complete(ev),
-            EventMsg::TurnAborted(ev) => match ev.reason {
-                TurnAbortReason::Interrupted => {
-                    self.on_interrupted_turn(ev.reason);
+            EventMsg::TurnAborted(ev) => {
+                if !from_replay && self.printrevolt_pending_template_generation.is_some() {
+                    self.abort_printrevolt_template_generation(format!("{:?}", ev.reason));
                 }
-                TurnAbortReason::Replaced => {
-                    self.on_error("Turn aborted: replaced by a new task".to_owned())
+                match ev.reason {
+                    TurnAbortReason::Interrupted => {
+                        self.on_interrupted_turn(ev.reason);
+                    }
+                    TurnAbortReason::Replaced => {
+                        self.on_error("Turn aborted: replaced by a new task".to_owned())
+                    }
+                    TurnAbortReason::ReviewEnded => {
+                        self.on_interrupted_turn(ev.reason);
+                    }
                 }
-                TurnAbortReason::ReviewEnded => {
-                    self.on_interrupted_turn(ev.reason);
-                }
-            },
+            }
             EventMsg::PlanUpdate(update) => self.on_plan_update(update),
             EventMsg::ExecApprovalRequest(ev) => {
                 // For replayed events, synthesize an empty id (these should not occur).

@@ -20,6 +20,9 @@ pub enum SlashCommand {
     Experimental,
     Skills,
     Review,
+    Templates,
+    Policy,
+    Pipelines,
     Rename,
     New,
     Resume,
@@ -62,6 +65,9 @@ impl SlashCommand {
             SlashCommand::Init => "create an AGENTS.md file with instructions for Codex",
             SlashCommand::Compact => "summarize conversation to prevent hitting the context limit",
             SlashCommand::Review => "review my current changes and find issues",
+            SlashCommand::Templates => "manage PrintRevolt prompt templates",
+            SlashCommand::Policy => "inspect/manage PrintRevolt policy",
+            SlashCommand::Pipelines => "inspect/manage PrintRevolt pipelines",
             SlashCommand::Rename => "rename the current thread",
             SlashCommand::Resume => "resume a saved chat",
             SlashCommand::Fork => "fork the current chat",
@@ -104,7 +110,12 @@ impl SlashCommand {
     pub fn supports_inline_args(self) -> bool {
         matches!(
             self,
-            SlashCommand::Review | SlashCommand::Rename | SlashCommand::Plan
+            SlashCommand::Review
+                | SlashCommand::Rename
+                | SlashCommand::Plan
+                | SlashCommand::Templates
+                | SlashCommand::Policy
+                | SlashCommand::Pipelines
         )
     }
 
@@ -124,6 +135,9 @@ impl SlashCommand {
             | SlashCommand::ElevateSandbox
             | SlashCommand::Experimental
             | SlashCommand::Review
+            | SlashCommand::Templates
+            | SlashCommand::Policy
+            | SlashCommand::Pipelines
             | SlashCommand::Plan
             | SlashCommand::Logout
             | SlashCommand::MemoryDrop

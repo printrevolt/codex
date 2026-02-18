@@ -119,6 +119,7 @@ use super::file_search_popup::FileSearchPopup;
 use super::footer::CollaborationModeIndicator;
 use super::footer::FooterMode;
 use super::footer::FooterProps;
+use super::footer::PrintRevoltTemplateIndicator;
 use super::footer::SummaryLeft;
 use super::footer::can_show_left_with_context;
 use super::footer::context_window_line;
@@ -307,6 +308,10 @@ pub(crate) struct ChatComposer {
     connectors_enabled: bool,
     personality_command_enabled: bool,
     windows_degraded_sandbox_active: bool,
+    printrevolt_disable_templates: bool,
+    printrevolt_disable_policy: bool,
+    printrevolt_disable_pipelines: bool,
+    printrevolt_template_indicator: Option<PrintRevoltTemplateIndicator>,
     status_line_value: Option<Line<'static>>,
     status_line_enabled: bool,
 }
@@ -405,6 +410,10 @@ impl ChatComposer {
             connectors_enabled: false,
             personality_command_enabled: false,
             windows_degraded_sandbox_active: false,
+            printrevolt_disable_templates: false,
+            printrevolt_disable_policy: false,
+            printrevolt_disable_pipelines: false,
+            printrevolt_template_indicator: None,
             status_line_value: None,
             status_line_enabled: false,
         };
@@ -475,6 +484,25 @@ impl ChatComposer {
 
     pub fn set_personality_command_enabled(&mut self, enabled: bool) {
         self.personality_command_enabled = enabled;
+    }
+
+    pub(crate) fn set_printrevolt_disabled_slash_commands(
+        &mut self,
+        templates: bool,
+        policy: bool,
+        pipelines: bool,
+    ) {
+        self.printrevolt_disable_templates = templates;
+        self.printrevolt_disable_policy = policy;
+        self.printrevolt_disable_pipelines = pipelines;
+        self.sync_popups();
+    }
+
+    pub(crate) fn set_printrevolt_template_indicator(
+        &mut self,
+        indicator: Option<PrintRevoltTemplateIndicator>,
+    ) {
+        self.printrevolt_template_indicator = indicator;
     }
     /// Centralized feature gating keeps config checks out of call sites.
     fn popups_enabled(&self) -> bool {
@@ -2693,6 +2721,7 @@ impl ChatComposer {
             context_window_used_tokens: self.context_window_used_tokens,
             status_line_value: self.status_line_value.clone(),
             status_line_enabled: self.status_line_enabled,
+            printrevolt_template_indicator: self.printrevolt_template_indicator.clone(),
         }
     }
 
@@ -2929,6 +2958,9 @@ impl ChatComposer {
             self.connectors_enabled,
             self.personality_command_enabled,
             self.windows_degraded_sandbox_active,
+            self.printrevolt_disable_templates,
+            self.printrevolt_disable_policy,
+            self.printrevolt_disable_pipelines,
         ) {
             return true;
         }
@@ -2988,6 +3020,9 @@ impl ChatComposer {
                             connectors_enabled,
                             personality_command_enabled,
                             windows_degraded_sandbox_active: self.windows_degraded_sandbox_active,
+                            printrevolt_disable_templates: self.printrevolt_disable_templates,
+                            printrevolt_disable_policy: self.printrevolt_disable_policy,
+                            printrevolt_disable_pipelines: self.printrevolt_disable_pipelines,
                         },
                     );
                     command_popup.on_composer_text_change(first_line.to_string());

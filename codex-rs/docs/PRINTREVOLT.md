@@ -28,12 +28,19 @@ Minimal example (`<CODEX_HOME>/printrevolt.toml`):
 enabled = true
 
 [printrevolt.policy]
+enabled = true
 deny_dangerous_always = true
 
 [printrevolt.policy.verify]
 required = true
 max_age_ms = 600000
 command_prefixes = [["npm","test"]]
+
+[printrevolt.pipelines]
+enabled = false
+
+[printrevolt.templates]
+selection_mode = "off"
 
 [printrevolt.hooks]
 enabled = true
@@ -43,6 +50,10 @@ trusted_repo_roots = ["/abs/path/to/repo"]
 Notes:
 - `command_prefixes` matches **argv prefixes** for the `shell` tool (for example `["npm","test"]`).
 - If verification runs via the `shell_command` tool (single string command), use single-element prefixes such as `["npm test"]`.
+- Safe defaults:
+  - policy enforcement defaults to disabled (`printrevolt.policy.enabled=false`)
+  - pipelines default to disabled (`printrevolt.pipelines.enabled=false`)
+  - templates UI defaults to off (`printrevolt.templates.selection_mode="off"`)
 
 ## Policy + Hooks (tool boundary)
 
@@ -59,6 +70,13 @@ Current hook surface:
 ## Pipelines (typed parts)
 
 Pipelines are a typed state machine. Parts emit actions; any command execution is still a normal tool call and therefore goes through policy + hooks + upstream approvals.
+
+Repo pipelines bundle (project scope) is loaded only when the repo root is trusted/allowlisted (mirrors repo templates/hooks/commands trust).
+
+Reusable parts (schema `"2"`):
+- `pipelines.json` supports `components` plus `use_component` for compile-time composition.
+- `codex-pr pipelines show --expanded --json` can be used to preview the expanded pipeline with components inlined.
+- Root-level spec: `PrintRevolt-Codex-CLI-Fork-Pipelines-Components.md`
 
 Teardown:
 
@@ -102,6 +120,9 @@ Adapter helpers:
 codex-pr templates list --json
 codex-pr templates validate
 codex-pr templates draft --id one-off --name "My Template" --description "..." --tag security --prompt "..."
+codex-pr templates compose-prompt --template-id <id> --prompt "..."
+codex-pr templates enable   --scope global
+codex-pr templates disable  --scope global
 ```
 
 ## Updater

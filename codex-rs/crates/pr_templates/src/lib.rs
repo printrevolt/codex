@@ -127,6 +127,16 @@ pub fn discover_templates(
         &mut warnings,
     );
 
+    let drafts_dir = codex_home.join("printrevolt").join("drafts");
+    load_from_dir(
+        &drafts_dir,
+        TemplateSource::Draft,
+        "draft",
+        cfg.max_bytes,
+        &mut templates,
+        &mut warnings,
+    );
+
     if repo_trusted {
         if let Some(repo_root) = repo_root {
             let repo_dir = repo_root.join(".codex").join("templates");
@@ -175,6 +185,43 @@ pub fn clamp_policy_defaults(
             out.verify.max_age_ms = max_age_ms;
         }
     }
+    out
+}
+
+pub fn compose_prompt(raw_prompt: &str, template: &Template) -> String {
+    compose_prompt_from_contract(raw_prompt, template.name.as_str(), &template.contract)
+}
+
+pub fn compose_prompt_from_contract(
+    raw_prompt: &str,
+    template_name: &str,
+    contract: &TemplateContract,
+) -> String {
+    let mut out = String::new();
+    out.push_str("[TEMPLATE: ");
+    out.push_str(template_name);
+    out.push_str("]\n\n");
+
+    out.push_str("Role + Objective:\n");
+    out.push_str(contract.role_objective.trim());
+    out.push_str("\n\n");
+
+    out.push_str("Procedure:\n");
+    out.push_str(contract.procedure.trim());
+    out.push_str("\n\n");
+
+    out.push_str("Outputs:\n");
+    out.push_str(contract.outputs.trim());
+    out.push_str("\n\n");
+
+    out.push_str("Tooling Scope:\n");
+    out.push_str(contract.tooling_scope.trim());
+    out.push_str("\n\n");
+
+    out.push_str("User request:\n");
+    out.push_str(raw_prompt.trim());
+    out.push('\n');
+
     out
 }
 
@@ -379,5 +426,20 @@ No network.
         let res = discover_templates(&codex_home, None, false, TemplateDiscoveryConfig::default());
         assert_eq!(res.templates.len(), 1);
         assert_eq!(res.templates[0].name, "Security Reviewer");
+    }
+
+    #[test]
+    fn composes_prompt_from_contract() {
+        let contract = TemplateContract {
+            role_objective: "Be strict.".to_string(),
+            procedure: "Do steps.".to_string(),
+            outputs: "List issues.".to_string(),
+            policy_defaults: "Tighten policy.".to_string(),
+            tooling_scope: "No network.".to_string(),
+        };
+        let out = compose_prompt_from_contract("Fix tests", "Security Reviewer", &contract);
+        assert!(out.contains("[TEMPLATE: Security Reviewer]"));
+        assert!(out.contains("Role + Objective:\nBe strict."));
+        assert!(out.contains("User request:\nFix tests"));
     }
 }

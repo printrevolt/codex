@@ -75,6 +75,7 @@ mod skill_popup;
 mod skills_toggle_view;
 mod slash_commands;
 pub(crate) use footer::CollaborationModeIndicator;
+pub(crate) use footer::PrintRevoltTemplateIndicator;
 pub(crate) use list_selection_view::ColumnWidthMode;
 pub(crate) use list_selection_view::SelectionViewParams;
 mod feedback_view;
@@ -282,6 +283,25 @@ impl BottomPane {
 
     pub fn set_personality_command_enabled(&mut self, enabled: bool) {
         self.composer.set_personality_command_enabled(enabled);
+        self.request_redraw();
+    }
+
+    pub(crate) fn set_printrevolt_disabled_slash_commands(
+        &mut self,
+        templates: bool,
+        policy: bool,
+        pipelines: bool,
+    ) {
+        self.composer
+            .set_printrevolt_disabled_slash_commands(templates, policy, pipelines);
+        self.request_redraw();
+    }
+
+    pub(crate) fn set_printrevolt_template_indicator(
+        &mut self,
+        indicator: Option<PrintRevoltTemplateIndicator>,
+    ) {
+        self.composer.set_printrevolt_template_indicator(indicator);
         self.request_redraw();
     }
 

@@ -12,6 +12,18 @@ Key design decisions include: (a) a **shared domain types crate** (`pr_types`) t
 
 The primary risks are bypass attempts (alternate tools/MCP, config poisoning, hook spoofing) and cross-platform edge cases (Windows junctions/reparse points, WSL path mixing, shell quoting). Mitigations include: intercepting **all** tool calls (including plugin/MCP tool dispatch), clamping policy floors after hook modifications, ensuring default-deny on evaluation errors for mutating operations, strict repo-root path containment for filesystem mutation tools, storing and verifying update metadata, and comprehensive adversarial tests (symlink/junction traversal, destructive command patterns, and tool interception coverage).
 
+## 0.1 Related Docs
+
+- `PrintRevolt-Codex-CLI-Fork-Slash-Commands-Extension.md` (agent-session slash commands UX + command surface plan)
+- `PRINTREVOLT_LOCAL_MACHINE.md` (local build/test/rollback notes)
+- `PRINTREVOLT_UPSTREAM_MIRROR.md` (upstream mirror + sync workflow)
+
+## 0.2 Change Log
+
+- 2026-02-17: Added `PrintRevolt-Codex-CLI-Fork-Slash-Commands-Extension.md` and moved PrintRevolt usage docs into the repo root.
+- 2026-02-17: Updated template selection contract for slash-command UX (task-scoped template selection; session-scoped mode/default/sticky) and added supervisor disable controls for slash commands.
+- 2026-02-18: Added `PrintRevolt-Codex-CLI-Fork-Command-Center-UX-Contract.md` as the consolidated Command Center UX/integration contract (agent vs headless flows, review/apply/backup expectations).
+
 ---
 
 ## 1) Requirements
@@ -170,7 +182,7 @@ Shared types/schemas: crates/pr_types
 ### 2.3 Source of truth for state
 
 - **Configuration:** read from upstream Codex config + PrintRevolt config layers (Mode A and/or Mode B). PrintRevolt writes only to PrintRevolt-owned files by default.
-- **Pipelines:** global pipeline bundle at `CODEX_HOME/printrevolt/pipelines.json` plus optional project bundle at `<repo>/.codex/printrevolt/pipelines.json` (trusted repos only). Pipeline run state is in-memory per session/task.
+- **Pipelines:** global pipeline bundle at `CODEX_HOME/printrevolt/pipelines.json` plus project bundle at `<repo>/.codex/printrevolt/pipelines.json` (scope-selectable in headless CLI). Pipeline run state is in-memory per session/task.
 - **Audit logs:** append-only JSONL log at PrintRevolt-owned path under `CODEX_HOME/printrevolt/` (default).
 - **Evidence store:** in-memory per session; optional on-disk evidence cache under `CODEX_HOME/printrevolt/evidence.json` (opt-in). Evidence is always validated against a repo fingerprint and TTL.
 
@@ -229,7 +241,7 @@ use std::path::PathBuf;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionId(pub String); // UUID string (lowercase)
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+	#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionContext {
     pub id: SessionId,
     pub repo_root: PathBuf,        // user-provided / upstream working dir
@@ -237,10 +249,33 @@ pub struct SessionContext {
     pub cwd: PathBuf,              // canonicalized
     pub os: OsKind,
     pub shell: ShellKind,
-    pub template: Option<TemplateRef>,
+    /// Optional agent identity used for per-agent configuration overrides and UI state.
+    /// If unavailable, treat as "default".
+    pub agent_id: Option<String>,
+    /// Session-scoped template UX state (mutable via explicit user actions).
+    /// The template actually applied to a prompt is task-scoped (see TaskContext).
+    pub template_state: TemplateSessionState,
     pub repo_state: RepoState,     // refreshed by runtime
     pub approvals: ApprovalsState, // mirrors upstream approvals (summary only)
     pub started_at_ms: i64,        // unix epoch millis
+}
+
+	#[derive(Clone, Debug, Serialize, Deserialize)]
+	#[serde(rename_all = "snake_case")]
+	pub enum TemplateSelectionMode {
+	    Off,
+	    Once,
+	    EveryTime,
+	}
+
+	#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TemplateSessionState {
+    /// When to prompt the user for template selection.
+    pub selection_mode: TemplateSelectionMode,
+    /// Highlighted in the picker when the picker is shown; never auto-applied unless a picker is shown.
+    pub default_for_picker: Option<TemplateRef>,
+    /// Used only for `selection_mode=once` to avoid prompting repeatedly.
+    pub sticky: Option<TemplateRef>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1048,7 +1083,8 @@ Fields (see `pr_types::session::SessionContext` above) plus invariants:
 - `cwd` MUST be within `repo_root_real` at session start; otherwise:
   - if `cwd` cannot be canonicalized: deny session start (requires user remediation).
   - if `cwd` outside repo root: set `cwd = repo_root_real` and log `SessionCwdReset` event.
-- `template` contains the selected template reference (source + id) and is immutable after session start (except when user restarts session).
+- Session-scoped template state (`template_state`) is mutable only via explicit user actions (slash commands / picker).
+- The template selected for a specific prompt is task-scoped and immutable once `UserTurn` is dispatched.
 
 ### 4.1.1 Task / Turn / Interrupt context
 
@@ -1068,6 +1104,14 @@ pub struct TaskContext {
     pub id: TaskId,
     pub user_turn_id: Option<String>,   // upstream id if available
     pub prompt_preview: Option<String>, // redacted + truncated (default ≤ 256 chars)
+    /// Template selected for this task/prompt (immutable once `UserTurn` is dispatched).
+    ///
+    /// This is distinct from `SessionContext.template_state` (mode/default/sticky/MRU), which is
+    /// mutable for future prompts via explicit user actions.
+    pub template: Option<TemplateRef>,
+    /// Hash of the exact generated prompt string that was dispatched for this task.
+    /// Used for audit/debug without persisting full prompt text.
+    pub generated_prompt_sha256: Option<String>,
     pub started_at_ms: i64,
 }
 
@@ -1235,181 +1279,72 @@ pub enum HookSource { User, Repo }
 	}
 	```
 
-### 4.5.1 Pipelines (Pipeline / Workflow / Part)
+### 4.5.1 Pipelines (Bundle / Pipeline / Workflow / Part)
 
-Pipelines are stored as bundles (global + project) and compiled into deterministic executable graphs. The CLI supports only **typed parts**; a “run command” part always uses canonical argv (no raw shell by default).
+Pipelines are stored as bundles (global + project) and executed by the `codex_pr_pipelines` engine using **typed parts**.
+
+The on-disk format is described in §6.4.2 (`pipelines.json`, schema `"1"` / `"2"`). The source of truth for implementation types is `codex/codex-rs/crates/pr_pipelines/src/lib.rs`.
 
 ```rust
-// pr_types/pipelines.rs
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct PipelineId(pub String);
+use std::collections::BTreeMap;
+
+pub type WorkflowId = String;
+pub type ComponentId = String;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct WorkflowId(pub String);
+pub struct PipelineBundleV2 {
+    pub schema_version: String, // "2"
+    #[serde(default)]
+    pub components: BTreeMap<ComponentId, ComponentV2>,
+    #[serde(default)]
+    pub pipelines: BTreeMap<String, PipelineEntryV2>,
+}
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct PartId(pub String);
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct PipelineBundle {
-    pub schema_version: String, // "1"
-    pub pipelines: Vec<Pipeline>,
-    pub workflows: Vec<Workflow>,
+pub struct PipelineEntryV2 {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub enabled: bool,
+    pub pipeline: Pipeline,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Pipeline {
-    pub id: PipelineId,
-    pub name: String,
-    // Optional enable flag for “library” pipelines stored in a bundle but not active by default.
-    // Disabled pipelines are ignored for lifecycle triggers and cannot be selected unless explicitly enabled.
-    pub enabled: Option<bool>, // default true
-    pub triggers: Vec<PipelineTrigger>,
-    pub entry_workflow: WorkflowId,
-    pub loop_guards: LoopGuards,
-    pub capabilities: Vec<PipelineCapability>,
-}
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PipelineTrigger {
-    OnSessionStart,
-    BeforeTask,
-    BeforeFinalize,
-    OnSessionEnd,
+    pub workflows: BTreeMap<WorkflowId, Workflow>,
+    pub entry: WorkflowId,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Workflow {
-    pub id: WorkflowId,
-    pub name: String,
-    pub parts: Vec<WorkflowPart>,
-    // Optional workflow-level teardown that runs on any exit (success/failure/block/interrupt),
-    // best-effort and bounded. See §6.4.6.
+    pub parts: Vec<Part>,
+    #[serde(default)]
     pub finally_workflow: Option<WorkflowId>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct WorkflowPart {
-    pub id: PartId,
-    pub label: Option<String>,
-    pub kind: PartKind,
-    pub when: Option<Predicate>,
-    // Optional explicit transitions. If omitted, compilation sets:
-    // - `on_success = Next::NextPart` (unless this is the last part)
-    // - `on_failure = Next::Block{...}` for gate triggers (before_task/before_finalize),
-    //   or `Next::Complete` for observe-only triggers.
-    pub on_success: Option<Next>,
-    pub on_failure: Option<Next>,
-    // Optional per-part retry policy (bounded by pipeline-level loop guards).
-    pub retry: Option<RetryPolicy>,
-    // Optional per-part deferred cleanup actions. If the part executes (not skipped),
-    // these are pushed onto a cleanup stack and run on workflow/pipeline exit (LIFO).
-    // Each cleanup action is executed via the normal tool boundary (policy + hooks + approvals).
-    pub defer: Option<Vec<PartKind>>,
-}
+#[serde(tag = "part_kind", rename_all = "snake_case")]
+pub enum Part {
+    RunTool { tool_call: ToolCall },
+    RunCommand { cwd: Option<String>, argv: Option<Vec<String>>, command_id: Option<String>, timeout_ms: Option<u64>, child_process_policy: ChildProcessPolicy },
+    RequireApproval { scope: ApprovalScope, mode: ApprovalMode, prompt: String, remediation: Vec<String>, action_hash: String, output_key: Option<String> },
+    ExtractValue { source: ExtractSource, parser: ExtractParser, output_key: String, normalize: Vec<NormalizeOp> },
+    AssertFact { key: String, equals: Option<String>, matches_regex: Option<String> },
+    EnsureWorktree { worktree_root: String, naming: String, base_branch: Option<String>, branch_name: String, require_approval: bool },
+    EnsureBranch { base_branch: Option<String>, branch_name: String, protected_branches: Vec<String>, require_approval: bool },
+    SetVar { key: String, value: String },
+    Fail { message: String },
+    Defer { part: Box<Part> },
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct FactKey(pub String);
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum FactValue {
-    String(String),
-    Int(i64),
-    Bool(bool),
-}
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct RetryPolicy {
-    pub max_attempts: u32,          // default 1; max clamped by config
-    pub backoff_ms: Option<u64>,    // default none; bounded
-}
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum Next {
-    NextPart,
-    GotoWorkflow { workflow_id: WorkflowId },
-    GotoPart { workflow_id: WorkflowId, part_id: PartId },
-    Complete,
-    Block { code: String, reason: String, remediation: Vec<String> },
-}
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum PartKind {
-    EmitNote { message: String },
-    RequireApproval { scope: String, prompt: String },
-    ComputeChangedFiles { base_ref: String, include_uncommitted: bool },
-    RunCommand {
-        cwd: String,
-        // Exactly one of `argv` or `command_id` MUST be present.
-        argv: Option<Vec<String>>,
-        command_id: Option<String>,
-        category: String,
-        timeout_ms: Option<u64>,
-        // Optional child-process posture. Note: this is best-effort and platform-dependent.
-        child_process_policy: Option<ChildProcessPolicy>,
-    },
-    AssertLastResult { exit_code: Option<i32>, stderr_regex: Option<String> },
-    EnsureWorktree { worktree_root: String, naming: String, require_approval: bool },
-    // Ensure work occurs on a non-protected branch, typically per-task.
-    // Branch creation/switching is approval-gated and clamped by protected branch rules.
-    EnsureBranch {
-        base_branch: Option<String>, // default `${var.BASE_BRANCH}`
-        naming: String,              // e.g. `prcc/${session_id}`
-        require_approval: bool,
-    },
-    CheckDocker { mode: String, probe_argv: Vec<String> },
-    SuggestAgentFix { template: String, require_user_confirm: bool },
-    // Derive a small FactValue from bounded tool output previews.
-    ExtractValue {
-        source: ExtractSource,         // stdout|stderr|combined
-        parser: ExtractParser,         // json_path|regex
-        output_key: FactKey,
-        // Optional normalization (e.g., lowercasing) before parsing.
-        normalize: Option<Vec<String>>,
-    },
-    // Gate/branch based on derived facts without rerunning tools.
-    AssertFact { key: FactKey, equals: Option<FactValue>, matches_regex: Option<String> },
-    // Optional advanced part: query the agent (Codex) for a structured decision and route accordingly.
-    // This is still bounded and deterministic: the agent must choose from an allowlisted set of next steps.
-    RequestAgentDecision {
-        prompt_template: String,
-        allowed_next_workflows: Vec<WorkflowId>,
-        require_user_confirm: bool,
-    },
-    LoopGuard { max_cycles: u32, repeat_failure_signature_limit: u32 },
-}
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ChildProcessPolicy {
-    // Default: no per-child gating beyond upstream sandbox/OS containment.
-    Inherit,
-    // Record child execs and fail/branch if disallowed (platform-specific).
-    AuditAllowlist,
-    // Attempt to prevent non-allowlisted execs (platform-specific; may be unsupported).
-    EnforceAllowlist,
-}
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ExtractSource { Stdout, Stderr, Combined }
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ExtractParser {
-    JsonPath { path: String },
-    Regex { pattern: String, group: Option<u32> },
+    // Schema "2" composition primitive:
+    UseComponent { id: ComponentId, args: BTreeMap<String, String> },
 }
 ```
 
-**Invariants**
-- All strings that may contain secrets (tool output, prompts) MUST be redacted/bounded before persistence or emission.
-- `RunCommand.argv` MUST be canonical argv (no shell string) unless explicitly break-glass enabled.
-- Pipeline capabilities are clamped by policy floors.
+Notes:
+- Current execution model is linear (parts execute in order). There is no branching or lifecycle triggers in the on-disk schema yet.
+- Schema `"2"` adds compile-time component expansion (`components` + `use_component`) so pipelines can reuse parts across workflows.
+- Pipelines are feature-gated by config: `[printrevolt.pipelines] enabled = true`.
 
 ### 4.6 Template (saved + draft)
 
@@ -1967,30 +1902,17 @@ Key principle: pipeline-initiated work MUST execute via the same tool boundary a
 
 This preserves the “guaranteed enforcement boundary” even when automation is not model-driven.
 
-#### 6.4.1 Lifecycle triggers
+#### 6.4.1 Lifecycle integration (current vs future)
 
-Pipelines run on a subset of the same lifecycle signals as hooks:
-- `on_session_start`: run preflight that is independent of the user prompt (best-effort; should be fast).
-- `before_task`: run preflight that depends on task/prompt/template and may deny start.
-- `before_finalize`: run verify/fix loop gates; may deny completion.
-- `on_session_end`: best-effort cleanup/reporting only (MUST NOT be required for correctness).
+Current implementation status:
+- Pipelines are **defined as data** (`pipelines.json`) and can be **inspected/managed** via `codex-pr pipelines ...`.
+- Automatic lifecycle execution (for example `before_finalize`) is **not wired into Codex runtime yet**.
 
-**Manual invocation (no bypass)**
-- In this fork, pipelines are primarily lifecycle-driven (automatic at gates).
-- There is no built-in “run pipeline now” slash command specified by default.
-- Optional extension (recommended for Command Center + TUI parity):
-  - Add a CLI/TUI command: `/pipelines run <pipeline_id> [--trigger before_finalize]`
-  - Add a headless protocol method: `session.run_pipeline { pipeline_id, trigger }`
-  - Semantics:
-    - runs the pipeline as if the given trigger fired (“synthetic trigger”)
-    - all actions still transit the normal tool boundary (policy + hooks + approvals)
-    - emits `Pipeline*` events so UIs can show progress and blocks
-    - does not alter policy floors or evidence directly; it only drives tool calls that may produce evidence.
+Future (when wired):
+- Pipelines may run on lifecycle signals similar to hooks (for example `before_task` / `before_finalize`).
+- Pipeline-initiated actions MUST still transit the normal tool boundary (policy + hooks + approvals).
 
-Observe-only integration points (pipeline can emit notes but should not block):
-- `on_turn_aborted`, `on_interrupt`, `after_task` (e.g., mark pipeline run as aborted).
-
-#### 6.4.2 Definition, compilation, and precedence
+#### 6.4.2 Definition, expansion, and precedence
 
 **Bundle locations**
 - Global (user) pipeline bundle:
@@ -1998,22 +1920,28 @@ Observe-only integration points (pipeline can emit notes but should not block):
 - Project pipeline bundle:
   - `<repo_root>/.codex/printrevolt/pipelines.json`
 
-**Bundle format (`pipelines.json`, schema `"1"`)**
-- Top-level:
-  - `schema_version`: `"1"`
-  - `pipelines`: list of pipeline headers (selectable by id)
-  - `workflows`: list of workflow definitions (reusable units)
-- Pipeline headers may include:
-  - `enabled` (default true): supports keeping “library” pipelines in a bundle without activating them.
-- Workflows are executable graphs expressed as ordered parts plus optional explicit transitions:
-  - If a part omits `on_success`, compilation treats it as `next_part` (or `complete` if last).
-  - If a part omits `on_failure`, compilation uses safe defaults:
-    - gate triggers (`on_session_start`, `before_task`, `before_finalize`): `block` with remediation
-    - observe-only triggers: `complete` (do not block)
-  - `when` predicates are evaluated with a bounded Facts store; if `when` is false, the part is skipped and treated as success.
-- Workflows may optionally specify teardown:
-  - `finally_workflow`: workflow id to run on any exit (success/failure/block/interrupt).
-  - Parts may optionally specify `defer`: a list of cleanup actions registered when the part executes; these run LIFO on exit.
+**Bundle format (`pipelines.json`, schema `"1"` / `"2"`)**
+
+Implementation note: the bundle format is designed to be easy to review and deterministic to execute. Execution still flows through the normal tool boundary (policy + approvals + hooks).
+
+Top-level (schema `"1"`):
+- `schema_version`: `"1"`
+- `pipelines`: map of `pipeline_id -> { id, name, enabled, pipeline }`
+
+Top-level (schema `"2"`):
+- `schema_version`: `"2"`
+- `components`: map of `component_id -> { params, parts }`
+- `pipelines`: map of `pipeline_id -> { id, name, enabled, pipeline }`
+
+Pipeline shape (both schemas):
+- `pipeline.entry`: workflow id
+- `pipeline.workflows`: map of `workflow_id -> { parts, finally_workflow? }`
+
+Parts:
+- Parts are typed (`run_command`, `require_approval`, `extract_value`, etc).
+- Schema `"2"` adds `use_component { id, args }` for compile-time composition.
+  - `use_component` MUST be expanded into concrete parts before execution (cycle-checked, size-limited).
+  - The runtime engine treats unexpanded `use_component` as invalid.
 
 **Precedence**
 Highest → lowest:
@@ -2023,17 +1951,17 @@ Highest → lowest:
 4) Built-in defaults (minimal safe pipeline)
 
 **Active vs inactive**
-- A pipeline is considered active for lifecycle triggers only when:
-  - pipelines are enabled globally (`[printrevolt.pipelines].enabled=true`)
-  - the pipeline is selected (`default_pipeline_id` or manual invocation) AND `enabled!=false`
-  - the current lifecycle event is present in `triggers`
-- Unselected or `enabled=false` pipelines are valid “library” definitions:
+- A pipeline is considered active only when:
+  - pipelines are enabled (`[printrevolt.pipelines].enabled=true`), AND
+  - the pipeline entry itself is enabled (`pipelines.<id>.enabled=true`).
+- Disabled entries are valid library definitions:
   - kept for future use
   - surfaced in UIs
-  - excluded from reachability calculations unless selected.
+  - excluded from any lifecycle execution (when that wiring is added).
 
 **Trust model**
-- Repo pipelines are treated like repo hooks: disabled by default and enabled only when the repo is explicitly trusted/allowlisted.
+- Repo pipelines are treated like repo templates/hooks/command catalogs:
+  - repo bundles are ignored unless the repo root is explicitly trusted/allowlisted.
 - Even when trusted, pipelines are clamped by policy floors and capability allowlists (see below).
 
 **Scoping and merge strategy**
@@ -2042,113 +1970,70 @@ Highest → lowest:
   - Project bundle: repo-specific automation (trusted/allowlisted only)
 - Effective pipeline set is computed by precedence (see above) with conservative rules:
   - No deep merge of workflow graphs at runtime.
-  - Project bundle may add pipelines/workflows and may override an existing pipeline/workflow by id.
-  - “Pack composition” (import/includes) is a compiler concern (flatten deterministically) rather than runtime merge.
+  - Project entries override global entries with the same pipeline id.
 
-**Compilation**
-- Pipeline definitions are compiled into a deterministic executable form:
-  - pre-parsed regex/glob predicates
-  - normalized argv templates (no raw shell by default)
-  - a transition table and loop guards
-- Compiled output is content-addressed (sha256) for auditability.
+**Execution model (current)**
+- Workflows execute linearly: parts run in list order.
+- Cleanup can run via:
+  - `finally_workflow` (always runs on exit), and/or
+  - `defer` (register LIFO cleanup actions).
+- There is no conditional branching or explicit loop construct in the current pipeline DSL.
+  - Bounded safety is enforced via global cycle limits.
 
-**Compiler invariants (end detection + safety)**
-- Compilation MUST produce an explicit, total control-flow graph:
-  - every part has explicit `on_success` and `on_failure` in the compiled form
-  - every transition target exists
-  - every workflow has at least one terminal path:
-    - `complete` OR `block`
-- “Falling off the end” is not allowed in the compiled form:
-  - if a workflow’s last part omits `on_success`, the compiler MUST fill `complete`
-  - if a part omits `on_failure`, the compiler MUST fill `block` for gate triggers and `complete` for observe-only triggers (per §6.4.2), but the compiled graph must still be explicit
-- If compilation cannot satisfy these invariants, codex-pr MUST disable the pipeline and audit the reason.
-
-**Pack composition (`includes`)**
-- Runtime deep-merge of graphs is intentionally avoided.
-- Pipelines should be composed at compile time:
-  - a pipeline/workflow definition MAY reference `includes` (pack ids/versioned references)
-  - the compiler flattens/includes into a single deterministic bundle:
-    - stable ids preserved
-    - overrides are explicit “replace by id” (no partial merges)
-  - compiled bundle contains `compiler_version` and `source_packs` metadata for audit.
+**Component expansion (schema `"2"`)**
+- Components are deterministic macros:
+  - `use_component` is expanded before execution into a concrete `parts` list.
+  - Expansion is recursive, cycle-checked, and bounded by limits.
+- Parameters:
+  - components declare `params` (with optional `default` values)
+  - `use_component.args` supplies string values for params
+  - args MUST be literal strings (args may not contain `${...}` placeholders)
+- Substitution:
+  - `${param.<NAME>}` is substituted into string fields during expansion.
+  - This is separate from runtime templating (`${var.*}` / `${fact.*}` / `${session_id}`), which happens during execution in a subset of fields.
 
 #### 6.4.2.1 Example bundle (default verify/fix loop)
 
 ```json
 {
-  "schema_version": "1",
-  "pipelines": [
-    {
-      "id": "default",
-      "name": "Default Verify Loop",
-      "triggers": ["before_task","before_finalize"],
-      "entry_workflow": "preflight",
-      "loop_guards": { "max_cycles": 3, "max_attempts_per_part": 2, "repeat_failure_signature_limit": 2 },
-      "capabilities": ["read_only","verify_exec_safe"]
-    }
-  ],
-  "workflows": [
-    {
-      "id": "preflight",
-      "name": "Preflight",
-      "parts": [
-        { "id": "note_preflight", "kind": { "kind":"emit_note", "message":"Running preflight checks." } },
-        {
-          "id": "ensure_worktree",
-          "kind": { "kind":"ensure_worktree", "worktree_root":"~/.codex/printrevolt/worktrees", "naming":"prcc/${session_id}", "require_approval": true }
-        },
-        {
-          "id": "docker",
-          "kind": { "kind":"check_docker", "mode":"warn", "probe_argv":["docker","info"] }
-        },
-        {
-          "id": "changed_files",
-          "kind": { "kind":"compute_changed_files", "base_ref":"merge_base_main", "include_uncommitted": true },
-          "on_success": { "kind":"goto_workflow", "workflow_id":"verify_frontend" }
-        }
-      ]
-    },
-    {
-      "id": "verify_frontend",
-      "name": "Verify Frontend",
+  "schema_version": "2",
+  "components": {
+    "verify.pm_test": {
+      "params": {
+        "pm": { "default": "npm" }
+      },
       "parts": [
         {
-          "id": "run_frontend_tests",
-          "when": { "kind":"changed_files_any", "globs":["frontend/**","web/**","ui/**"] },
-          "kind": { "kind":"run_command", "cwd":".", "argv":["npm","test"], "category":"verify", "timeout_ms": 900000 }
-        },
-        {
-          "id":"assert_ok",
-          "kind": { "kind":"assert_last_result", "exit_code": 0 },
-          "on_success": { "kind":"complete" },
-          "on_failure": { "kind":"goto_workflow", "workflow_id":"fix_and_retry" }
-        }
-      ]
-    },
-    {
-      "id": "fix_and_retry",
-      "name": "Suggest Fix + Retry",
-      "parts": [
-        {
-          "id":"suggest_fix",
-          "kind": { "kind":"suggest_agent_fix", "template":"Tests failed. Please fix and re-run: ${failed_command}", "require_user_confirm": true }
-        },
-        {
-          "id":"guard",
-          "kind": { "kind":"loop_guard", "max_cycles": 3, "repeat_failure_signature_limit": 2 },
-          "on_success": { "kind":"goto_workflow", "workflow_id":"verify_frontend" }
+          "part_kind": "run_command",
+          "cwd": ".",
+          "argv": ["${param.pm}", "test"]
         }
       ]
     }
-  ]
+  },
+  "pipelines": {
+    "verify": {
+      "id": "verify",
+      "name": "Verify",
+      "enabled": false,
+      "pipeline": {
+        "entry": "main",
+        "workflows": {
+          "main": {
+            "parts": [
+              { "part_kind": "use_component", "id": "verify.pm_test", "args": { "pm": "npm" } }
+            ]
+          }
+        }
+      }
+    }
+  }
 }
 ```
 
 Notes:
-- The compiled form includes explicit transitions (shown here) and loop guards. When `assert_ok` fails during `before_finalize`, the pipeline blocks completion until either:
-  - verification passes, or
-  - loop guards trip and the pipeline blocks with “needs human review”.
-- `suggest_agent_fix` produces a structured `suggested_user_message`; UIs may choose to send it to the agent (auto-send configurable).
+- This example is safe-by-default: `enabled=false`. It will not run automatically even when pipeline lifecycle wiring is added.
+- `use_component` is expanded before execution; `codex-pr pipelines show --expanded --json` can be used to preview the expanded form.
 
 #### 6.4.2.2 Variables, derived facts, and templating
 
@@ -2175,19 +2060,24 @@ Pipelines need a small, safe way to:
 2) **Facts**: bounded, ephemeral values produced by pipeline parts during execution (changed files, last tool result, derived statuses).
 3) **Secrets**: MUST NOT be stored in pipeline bundles or vars. Secrets remain in environment variables or OS keychains and are never surfaced in Facts except as “present/absent”.
 
-**Templating**
-- Pipelines may use a conservative placeholder system in a subset of fields:
-  - `ensure_worktree.naming`
-  - `emit_note.message`
-  - `suggest_agent_fix.template`
-  - `request_agent_decision.prompt_template`
-  - (optional) command catalog argv elements, if enabled
+**Runtime templating (`${...}`)**
+- Pipelines support a conservative placeholder system in a subset of string fields at execution time:
+  - `require_approval.prompt`
+  - `ensure_worktree.worktree_root`, `ensure_worktree.naming`, `ensure_worktree.branch_name`, `ensure_worktree.base_branch`
+  - `ensure_branch.branch_name`, `ensure_branch.base_branch`
+  - `set_var.value`
+  - `fail.message`
 - Supported placeholders:
   - `${session_id}`, `${task_id}`, `${turn_id}`
   - `${var.<NAME>}` (config vars)
   - `${fact.<KEY>}` (derived facts)
-  - `${failed_command}` (from `facts.last_tool_result.argv` when present)
-  - `${stderr_preview}` / `${stdout_preview}` (bounded previews only)
+- Unknown placeholders are errors.
+- `run_command.argv` is not runtime-templated (argv is treated as already-canonical).
+
+**Component substitution (`${param.<NAME>}`)**
+- Schema `"2"` component expansion supports compile-time substitution:
+  - `${param.<NAME>}` is substituted during `use_component` expansion.
+  - This can be used to parameterize `run_command` argv elements safely without runtime templating.
 
 **Resolution order**
 - On each part execution, resolve placeholders using:
@@ -2672,14 +2562,16 @@ Trust posture:
 ### 7.2 Draft template wizard (CLI/TUI behavior)
 
 Implementation note (v1):
-- codex-pr provides headless helpers for UIs to implement the picker/wizard: `codex-pr templates list --json`, `codex-pr templates validate`, `codex-pr templates draft ...` (writes draft `.md` under `CODEX_HOME/printrevolt/drafts/`).
-- The full interactive picker/wizard UX is owned by the Command Center (or another supervisor UI) using these adapters; codex-pr remains the source of truth for discovery/validation and safe persistence locations.
+- codex-pr provides headless helpers for UIs to implement the picker/wizard: `codex-pr templates list --json --scope global|project|both`, `codex-pr templates validate --scope global|project|both`, `codex-pr templates draft --scope global|project ...` (global writes to `CODEX_HOME/printrevolt/drafts/`, project writes to `<repo>/.codex/templates/`), and `codex-pr templates enable|disable --scope global|project`.
+- The full interactive picker/wizard UX may be owned by the Command Center (or another supervisor UI) using these adapters. The Codex TUI may also implement the picker and draft wizard directly; supervisors must be able to disable the in-TUI commands.
 
 **Menu option naming**
 In the template picker list, include:
 - `Default (no template)`
-- `<template.name> — <template.description>` for each discovered template
-- `✨ Create one-time template from prompt…` (draft wizard entry)
+- `[default] <template.name> — <template.description>` if a default-for-picker is configured
+- `✨ New Prompt Template...` (draft wizard entry)
+- most recently used templates (with “used X ago”)
+- remaining templates (alphabetical)
 
 **State machine**
 
@@ -2693,6 +2585,16 @@ In the template picker list, include:
      - select existing template -> Apply and start session
      - select Draft option -> Draft Wizard
      - cancel -> return to Prompt Editor (prompt preserved)
+
+**Selection modes**
+- `off`: no picker; no template applied.
+- `once`: if no sticky template is set for the session, show picker on send; chosen template becomes sticky until cleared/switched.
+- `every_time`: show picker on every send (preselect last-used or default-for-picker for speed).
+
+Selection modes are driven by configuration (`[printrevolt.templates].selection_mode`) with optional per-agent overrides.
+
+**Task immutability**
+- Once a prompt is dispatched as a `UserTurn`, the selected template for that task MUST NOT change (ensures audit, hooks, and gating are stable).
 
 3. **Draft Wizard**
    - Steps:
@@ -2874,7 +2776,7 @@ Template overlay is applied after prompt submit and is clamped.
   - precedence outcome per key (`ConfigTrace`)
   - warnings for invalid files (with line/column if available)
 - If config is missing:
-  - use safe defaults (policy enabled, enforcement warn mode for alpha, repo hooks off)
+  - use safe defaults (policy disabled, pipelines disabled, template selection off, repo hooks off)
 
 **Rollback**
 - Session-only:
@@ -2926,193 +2828,61 @@ PrintRevolt can optionally generate **recommendations** for policy, pipelines, c
 
 ### 8.6 Concrete config schema with defaults
 
-Default `printrevolt.toml` (Mode B):
+This section reflects the actual config keys implemented in `codex_pr_types::PrintRevoltConfig` and resolved by `codex_pr_config`.
+
+Default `printrevolt.toml` (Mode B) is safe-by-default: policy enforcement, pipelines, and template picker behavior are disabled unless explicitly enabled.
 
 ```toml
 [printrevolt]
 enabled = true
 
-[printrevolt.enforcement]
-mode = "warn"                # "warn" | "deny"
-deny_dangerous_always = true # beta/stable hard floor
-break_glass_enabled = true
-break_glass_scope = "one_off" # "one_off" | "session"
-safe_mode = false
-
 [printrevolt.policy]
-# Floors and core rules
-require_branch = true
-protected_branches = ["main", "master"]
-branch_scheme = "pr/%Y%m%d-{slug}"
+enabled = false
+deny_dangerous_always = true
 
-require_verify_on_finalize = true
-verify_cmd = "./devctl verify"
-verify_cmd_match = "exact"     # "exact" | "prefix" | "regex"
-verify_ttl_minutes = 10
-verify_floor_max_ttl_minutes = 30
-verify_cmd_locked = false
-allowed_verify_cmd_regex = ["^\\./devctl verify(\\s|$)"]
+[printrevolt.policy.verify]
+required = false
+max_age_ms = 1800000
+# Prefixes match canonical argv for the `shell` tool.
+# Example: command_prefixes = [["npm","test"], ["cargo","test"]]
+command_prefixes = []
 
-# Verification execution posture (optional)
-# Goal: prevent “random test runs” by the agent when you want pipelines to own verification routing.
-# - "allow": agent or pipelines may run verification commands (recommended default).
-# - "require_approval": agent verification requires explicit approval; pipelines still run normally.
-# - "pipeline_only": only pipeline-invoked verification runs without approval (agent-initiated verify is denied).
-verify_execution = "allow"      # "allow" | "require_approval" | "pipeline_only"
+[printrevolt.pipelines]
+enabled = false
+max_cycles = 3
 
-# Dangerous commands: always additive (floor ∪ requested)
-dangerous_shell_denylist = [
-  # Unix
-  "(?i)\\brm\\b.*\\s-rf\\s+/",
-  "(?i)\\bmkfs\\b",
-  "(?i)\\bdd\\b\\s+if=",
-  # Windows / PowerShell
-  "(?i)\\bformat(-volume)?\\b",
-  "(?i)\\bremove-item\\b.*-recurse.*-force",
-  "(?i)\\bdiskpart\\b"
-]
-
-# Filesystem containment
-deny_writes_outside_repo = true
-deny_mutations_in_paths = [".git/", ".codex/", ".agents/"]
-
-history_max = 200
+[printrevolt.templates]
+# "off" | "once" | "every_time"
+selection_mode = "off"
+# Empty string means "none".
+default_for_picker_template_id = ""
 
 [printrevolt.hooks]
 enabled = true
-trust_repo_hooks = false
-allowed_repo_roots = []
-allowed_repo_origins = []      # optional: match git remote
-timeout_ms = 2000
-stdin_max_bytes = 262144
-stdout_max_bytes = 262144
-stderr_max_bytes = 262144
-env_allowlist = ["PATH", "HOME", "USERPROFILE", "TEMP", "TMP", "SystemRoot", "COMSPEC", "CODEX_HOME"]
-request_schema_version = "2"   # "1" | "2"
-
-# Hook lists are explicit per event
-on_session_start = []
-on_session_end = []
-before_task = []
-on_turn_start = []
-before_tool = ["~/.codex/pr-hooks/before-tool.sh"]
-after_tool = []
-before_finalize = ["~/.codex/pr-hooks/before-finalize.sh"]
-on_turn_complete = []
-on_turn_aborted = []
-on_interrupt = []
-after_task = []
-on_item_started = []
-on_item_completed = []
-
-[printrevolt.pipelines]
-enabled = true
-default_pipeline_id = "default"
-trust_repo_pipelines = false
-allowed_repo_roots = []
-allowed_repo_origins = []      # optional: match git remote
-
-# Optional non-secret vars for templating and routing
-[printrevolt.vars]
-BASE_BRANCH = "main"
-WORKTREE_ROOT = "~/.codex/printrevolt/worktrees"
-BRANCH_NAMING = "prcc/${session_id}"
-
-# Cleanup defaults (user-controlled teardown)
-[printrevolt.cleanup]
-mode = "prompt"          # "prompt" | "always" | "never" | "manual"
-prompt_default = "deny"  # "deny" | "approve"
-# Optional per-kind overrides (destructive kinds should default prompt/manual)
-worktree = "manual"
-branch = "manual"
-service = "prompt"
-db = "prompt"
-
-# Optional command catalog (user-defined commands as data)
-[printrevolt.commands]
-enabled = true
-trust_repo_commands = false
-
-# Guardrails for pipeline execution volume and expensive facts
-[printrevolt.pipelines.limits]
-max_part_events_per_run = 500
-max_changed_files = 5000
-facts_cache_ttl_ms = 2000
-max_agent_prompts_per_run = 1   # cap `request_agent_decision`/agent-interaction parts per pipeline run
-
-# Loop guards
-max_cycles = 3
-max_attempts_per_part = 2
-repeat_failure_signature_limit = 2
-
-# Interaction behavior
-auto_send_suggested_user_message = false
-
-# Allowlisted command families (examples; still subject to policy floors)
-allowed_verify_argv_prefixes = [
-  ["npm","test"],
-  ["npm","run","test"],
-  ["pnpm","test"],
-  ["pnpm","run","test"],
-  ["yarn","test"],
-  ["cargo","test"]
-]
-
-# Optional additional allowlists (default: empty => `run_command` in that category blocks)
-allowed_lint_argv_prefixes = [
-  ["npm","run","lint"],
-  ["pnpm","run","lint"],
-  ["cargo","fmt"]
-]
-allowed_build_argv_prefixes = [
-  ["npm","run","build"],
-  ["pnpm","run","build"],
-  ["cargo","build"]
-]
-allowed_setup_argv_prefixes = []
-allowed_git_argv_prefixes = [
-  ["git","worktree"],
-  ["git","checkout","-b"]
-]
-
-[printrevolt.templates]
-prompt_after_submit = true
-allow_draft_templates = true
-draft_generation_mode = "heuristic" # "heuristic" | "model"
-model_classify = false
-suggest_threshold = 0.70
-max_bytes = 262144
-draft_save_default_scope = "user"    # "user" | "repo"
-
-# Bounded repo context collector for draft generation
-context_max_files = 200
-context_max_bytes = 524288
-context_time_budget_ms = 250
-context_exclude_globs = [".git/**", ".env", "**/*.pem", "**/*.key", "**/*.p12", "**/*.pfx"]
+trusted_repo_roots = []
+# before_tool = { argv = ["bash","/abs/path/to/hook.sh"], timeout_ms = 2000, headless_only = false, is_repo_provided = false }
 
 [printrevolt.audit]
 enabled = true
-path = "~/.codex/printrevolt/audit/events.jsonl"
-redaction_mode = "strict"      # "strict" | "balanced"
-max_file_mb = 50
-retain_days = 30
+max_file_bytes = 5242880
+max_files = 5
+redact_patterns = [
+  "(?i)(api[_-]?key|token|secret|password|pwd)\s*=\s*\S+",
+  "(?i)bearer\s+[a-z0-9._\\-]+",
+]
 
-[printrevolt.updater]
-enabled = true
-check_interval_hours = 24
-timeout_ms = 300
-channel = "stable"             # "alpha" | "beta" | "stable"
-source = "github"              # "npm" | "github"
-skip_versions = []
-auto_apply = false             # default off
+[printrevolt.ui]
+# Example values: "templates", "pipelines", "policy".
+disabled_slash_commands = []
 
-[printrevolt.advisor]
-enabled = false                # default off
-mode = "heuristic"             # "heuristic" | "model"
-allow_relaxations = false      # default: recommend tightening only
+[printrevolt.vars]
+# Non-secret variables used by pipeline runtime templating (${var.<NAME>}).
+# Example: BASE_BRANCH = "main"
 ```
 
----
+Notes:
+- Use `codex-pr policy enable|disable`, `codex-pr pipelines enable|disable`, and `codex-pr templates enable|disable` to flip the primary feature gates in a selected scope.
+- Repo-provided assets (templates, pipelines bundles, command catalogs, hooks) are ignored unless the repo root is allowlisted in `printrevolt.hooks.trusted_repo_roots`.
 
 ## 9) Updater + Upstream Sync Automation
 
@@ -3757,6 +3527,7 @@ Templates:
 1. Frontmatter and required headings are validated; invalid templates are ignored with warnings.
 2. Repo templates load only when repo is trusted/allowlisted.
 3. Adapter commands work: `codex-pr templates list/validate/draft`.
+4. TUI supports a review-first template drafting wizard, including an optional Codex-assisted generation path using structured JSON schema output.
 
 Repo ops:
 1. `codex-pr repo ensure-worktree/ensure-branch/remove-worktree` print a plan with action hash; execution only with `--apply`.

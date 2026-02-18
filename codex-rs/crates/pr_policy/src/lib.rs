@@ -37,6 +37,9 @@ impl PolicyEngine {
     }
 
     pub fn evaluate_tool_call(&self, call: &ToolCall) -> ToolCallDecision {
+        if !self.cfg.enabled {
+            return ToolCallDecision::allow();
+        }
         if self.cfg.deny_dangerous_always && self.is_dangerous(call) {
             return ToolCallDecision::block(
                 "PrDangerousCommandDenied",
@@ -47,6 +50,9 @@ impl PolicyEngine {
     }
 
     pub fn should_record_verify(&self, call: &ToolCall) -> bool {
+        if !self.cfg.enabled {
+            return false;
+        }
         let Some(argv) = extract_argv_like(call) else {
             return false;
         };
@@ -62,6 +68,9 @@ impl PolicyEngine {
         now: DateTime<Utc>,
         last_verify: Option<&VerifyEvidence>,
     ) -> Option<ToolCallDecision> {
+        if !self.cfg.enabled {
+            return None;
+        }
         if !self.cfg.verify.required {
             return None;
         }
