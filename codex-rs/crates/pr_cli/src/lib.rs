@@ -22,9 +22,10 @@ use codex_pr_repo_ops::WorktreeEnsureArgs;
 use codex_pr_types::WorkflowEntryV1;
 use codex_pr_types::WorkflowGraphV1;
 use codex_pr_types::WorkflowStepV1;
-use codex_pr_types::WorkflowsFileV1;
 use codex_pr_updater::UpdateChannel;
 use codex_pr_updater::UpdateCheckRequest;
+use codex_pr_workflows::read_workflows_file as read_workflows_file_core;
+use codex_pr_workflows::write_workflows_file as write_workflows_file_core;
 use codex_utils_home_dir::find_codex_home;
 use sha2::Digest as _;
 use sha2::Sha256;
@@ -932,28 +933,18 @@ impl PipelinesFile {
     }
 }
 
-fn read_workflows_file_from_path(path: &Path) -> Result<WorkflowsFileV1> {
-    if !path.exists() {
-        return Ok(WorkflowsFileV1::default());
-    }
-    let raw = std::fs::read_to_string(path)?;
-    let file = serde_json::from_str::<WorkflowsFileV1>(&raw)?;
-    file.validate()
-        .map_err(|err| anyhow::anyhow!("invalid workflows.json ({}): {err}", path.display()))?;
-    Ok(file)
+fn read_workflows_file_from_path(path: &Path) -> Result<codex_pr_types::WorkflowsFileV1> {
+    read_workflows_file_core(path)
+        .map_err(|err| anyhow::anyhow!("invalid workflows.json ({}): {err}", path.display()))
 }
 
-fn write_workflows_file(
+fn write_workflows_file_with_backup(
     codex_home: &Path,
     path: &Path,
-    file: &WorkflowsFileV1,
+    file: &codex_pr_types::WorkflowsFileV1,
 ) -> Result<Option<PathBuf>> {
     let backup = backup_file_if_present(path, codex_home, "workflows");
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let encoded = serde_json::to_string_pretty(file)?;
-    std::fs::write(path, encoded)?;
+    write_workflows_file_core(path, file).map_err(|err| anyhow::anyhow!("{err}"))?;
     Ok(backup)
 }
 
@@ -981,33 +972,30 @@ fn merged_workflows(
             );
         }
     }
-    if matches!(scope, Scope::Project | Scope::Both) {
-        if let Some(project_root) = project_root {
-            let trusted = repo_trusted(Some(project_root), codex_home);
-            if !trusted {
-                warnings.push(format!(
-                    "Repo workflows bundle ignored (repo not trusted): {}",
-                    project_root.display()
-                ));
-            } else {
-                let project_path = scoped_workflows_json_path(
-                    codex_home,
-                    Some(project_root),
-                    LayerScope::Project,
-                )?;
-                let project = read_workflows_file_from_path(project_path.as_path())?;
-                for (id, entry) in project.workflows {
-                    out.insert(
-                        id,
-                        WorkflowResolvedEntryV1 {
-                            id: entry.id,
-                            name: entry.name,
-                            enabled: entry.enabled,
-                            source: LayerScope::Project,
-                            workflow: entry.workflow,
-                        },
-                    );
-                }
+    if matches!(scope, Scope::Project | Scope::Both)
+        && let Some(project_root) = project_root
+    {
+        let trusted = repo_trusted(Some(project_root), codex_home);
+        if !trusted {
+            warnings.push(format!(
+                "Repo workflows bundle ignored (repo not trusted): {}",
+                project_root.display()
+            ));
+        } else {
+            let project_path =
+                scoped_workflows_json_path(codex_home, Some(project_root), LayerScope::Project)?;
+            let project = read_workflows_file_from_path(project_path.as_path())?;
+            for (id, entry) in project.workflows {
+                out.insert(
+                    id,
+                    WorkflowResolvedEntryV1 {
+                        id: entry.id,
+                        name: entry.name,
+                        enabled: entry.enabled,
+                        source: LayerScope::Project,
+                        workflow: entry.workflow,
+                    },
+                );
             }
         }
     }
@@ -1046,34 +1034,31 @@ fn merged_pipelines(
             );
         }
     }
-    if matches!(scope, Scope::Project | Scope::Both) {
-        if let Some(project_root) = project_root {
-            let trusted = repo_trusted(Some(project_root), codex_home);
-            if !trusted {
-                warnings.push(format!(
-                    "Repo pipelines bundle ignored (repo not trusted): {}",
-                    project_root.display()
-                ));
-            } else {
-                let project_path = scoped_pipelines_json_path(
-                    codex_home,
-                    Some(project_root),
-                    LayerScope::Project,
-                )?;
-                let project = read_pipelines_file_any_from_path(project_path.as_path())?.into_v2();
-                for (id, entry) in project.pipelines {
-                    // Project entries override global entries with the same id.
-                    out.insert(
-                        id,
-                        PipelineResolvedEntryV1 {
-                            id: entry.id,
-                            name: entry.name,
-                            enabled: entry.enabled,
-                            source: LayerScope::Project,
-                            pipeline: entry.pipeline,
-                        },
-                    );
-                }
+    if matches!(scope, Scope::Project | Scope::Both)
+        && let Some(project_root) = project_root
+    {
+        let trusted = repo_trusted(Some(project_root), codex_home);
+        if !trusted {
+            warnings.push(format!(
+                "Repo pipelines bundle ignored (repo not trusted): {}",
+                project_root.display()
+            ));
+        } else {
+            let project_path =
+                scoped_pipelines_json_path(codex_home, Some(project_root), LayerScope::Project)?;
+            let project = read_pipelines_file_any_from_path(project_path.as_path())?.into_v2();
+            for (id, entry) in project.pipelines {
+                // Project entries override global entries with the same id.
+                out.insert(
+                    id,
+                    PipelineResolvedEntryV1 {
+                        id: entry.id,
+                        name: entry.name,
+                        enabled: entry.enabled,
+                        source: LayerScope::Project,
+                        pipeline: entry.pipeline,
+                    },
+                );
             }
         }
     }
@@ -1139,10 +1124,7 @@ fn backup_file_if_present(target: &Path, codex_home: &Path, kind: &str) -> Optio
         return None;
     }
     let file_name = target.file_name()?.to_string_lossy().to_string();
-    let dir = codex_home
-        .join("printrevolt")
-        .join("backups")
-        .join(kind.to_string());
+    let dir = codex_home.join("printrevolt").join("backups").join(kind);
     if std::fs::create_dir_all(&dir).is_err() {
         return None;
     }
@@ -1164,7 +1146,7 @@ fn write_pipelines_file(
     path: &Path,
     file: &impl serde::Serialize,
 ) -> Result<Option<PathBuf>> {
-    let backup = backup_file_if_present(&path, codex_home, "pipelines");
+    let backup = backup_file_if_present(path, codex_home, "pipelines");
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -1243,11 +1225,7 @@ pub fn run() -> Result<()> {
                 resolve_printrevolt_config(codex_home.as_path(), project_root.as_deref(), None);
             if recommend {
                 let bundle = doctor_recommend(project_root.as_deref())?;
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&bundle)?);
-                } else {
-                    println!("{}", serde_json::to_string_pretty(&bundle)?);
-                }
+                println!("{}", serde_json::to_string_pretty(&bundle)?);
                 return Ok(());
             }
             if json {
@@ -1599,7 +1577,7 @@ pub fn run() -> Result<()> {
 
                     let entry = PipelineEntryV1 {
                         id: id.clone(),
-                        name: name.clone(),
+                        name,
                         enabled: false,
                         pipeline,
                     };
@@ -1618,7 +1596,7 @@ pub fn run() -> Result<()> {
                     let mut file = read_pipelines_file_any_from_path(path.as_path())?.into_v2();
                     file.schema_version = "2".to_string();
                     file.pipelines.insert(
-                        id.clone(),
+                        id,
                         PipelineEntryV2 {
                             id: entry.id,
                             name: entry.name,
@@ -1840,7 +1818,7 @@ pub fn run() -> Result<()> {
 
                     let entry = WorkflowEntryV1 {
                         id: id.clone(),
-                        name: name.clone(),
+                        name,
                         enabled: false,
                         workflow: WorkflowGraphV1 {
                             entry: "generate_prd".to_string(),
@@ -1861,10 +1839,14 @@ pub fn run() -> Result<()> {
                     )?;
                     let mut file = read_workflows_file_from_path(path.as_path())?;
                     file.schema_version = "1".to_string();
-                    file.workflows.insert(id.clone(), entry);
+                    file.workflows.insert(id, entry);
                     file.validate()
                         .map_err(|err| anyhow::anyhow!("invalid workflows draft: {err}"))?;
-                    let backup = write_workflows_file(codex_home.as_path(), path.as_path(), &file)?;
+                    let backup = write_workflows_file_with_backup(
+                        codex_home.as_path(),
+                        path.as_path(),
+                        &file,
+                    )?;
                     if let Some(path) = backup {
                         println!("Updated workflows.json (backup: {})", path.display());
                     } else {
@@ -1914,11 +1896,11 @@ pub fn run() -> Result<()> {
                         }
                     } else if let Ok(entries) = std::fs::read_dir(&root) {
                         for entry in entries.flatten() {
-                            if entry.path().is_dir() {
-                                if let Ok(files) = std::fs::read_dir(entry.path()) {
-                                    for f in files.flatten() {
-                                        out.push(f.path().display().to_string());
-                                    }
+                            if entry.path().is_dir()
+                                && let Ok(files) = std::fs::read_dir(entry.path())
+                            {
+                                for f in files.flatten() {
+                                    out.push(f.path().display().to_string());
                                 }
                             }
                         }
@@ -2027,7 +2009,10 @@ pub fn run() -> Result<()> {
                     let repo_root = discover_project_root(repo_root).ok_or_else(|| {
                         anyhow::anyhow!("failed to detect repo_root; pass --repo-root")
                     })?;
-                    let protected_refs = protected.iter().map(|s| s.as_str()).collect::<Vec<_>>();
+                    let protected_refs = protected
+                        .iter()
+                        .map(std::string::String::as_str)
+                        .collect::<Vec<_>>();
                     let plan = codex_pr_repo_ops::ensure_branch_plan(BranchEnsureArgs {
                         repo_root: repo_root.as_path(),
                         base_branch: base_branch.as_str(),
@@ -2182,7 +2167,7 @@ pub fn run() -> Result<()> {
                         format!(
                             "[{}]",
                             tag.iter()
-                                .map(|t| format!("{:?}", t))
+                                .map(|t| format!("{t:?}"))
                                 .collect::<Vec<_>>()
                                 .join(", ")
                         )
@@ -2191,7 +2176,7 @@ pub fn run() -> Result<()> {
                         r#"---
 name: {name}
 description: {description}
-tags: {tags}
+tags: {tags_yaml}
 defaults:
   policy:
     deny_dangerous_always: true
@@ -2218,11 +2203,7 @@ defaults:
 
 ## Prompt
 {prompt}
-"#,
-                        name = name,
-                        description = description,
-                        tags = tags_yaml,
-                        prompt = prompt
+"#
                     );
                     std::fs::write(&path, doc)?;
                     println!("{}", path.display());

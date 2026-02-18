@@ -25,6 +25,7 @@ codex-pr-types = { path = "../pr_types" }
 codex-pr-updater = { path = "../pr_updater" }
 codex-pr-advisor = { path = "../pr_advisor" }
 codex-pr-pipelines = { path = "../pr_pipelines" }
+codex-pr-workflows = { path = "../pr_workflows" }
 codex-utils-home-dir = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

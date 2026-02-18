@@ -74,6 +74,7 @@ members = [
     "crates/pr_templates",
     "crates/pr_updater",
     "crates/pr_advisor",
+    "crates/pr_workflows",
 ]
 resolver = "2"
 

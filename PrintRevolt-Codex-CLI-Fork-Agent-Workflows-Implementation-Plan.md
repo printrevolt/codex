@@ -476,11 +476,11 @@ Priority values:
 | WF-02 | Add config gate `[printrevolt.workflows]` (enabled + bounds) | P0 | Done | WF-01 | Added defaults in `pr_types`, `pr_config`, and installer init config. |
 | WF-03 | Add trust gating + scope merge for workflows (global/project/both) | P0 | Done | WF-01 | Implemented in `codex-pr workflows list/show` with warnings. |
 | WF-04 | Add backups for `workflows.json` writes | P1 | Done | WF-03 | Added write backups + restore flow and backups target support. |
-| WF-05 | Create crate `codex_pr_workflows` (engine skeleton + schema IO) | P0 | Planned | WF-01 | Keep the engine pure and testable. |
-| WF-06 | Artifact store (content-addressed files + metadata + size limits) | P0 | Planned | WF-05, WF-02 | Default root under `CODEX_HOME/printrevolt/artifacts/workflows/`. |
-| WF-07 | Workflow engine control flow (steps + transitions + bounded revision loop) | P0 | Planned | WF-06 | Implement `generate_artifact`, `review_artifact`, `revise_artifact`, `complete`. |
-| WF-08 | Action protocol (`WorkflowAction` + results) for headless runner | P0 | Planned | WF-07 | Must support "emit JSON actions" mode for supervisors. |
-| WF-09 | CLI: `codex-pr workflows list/show/draft/restore` | P1 | Planned | WF-03, WF-04, WF-05 | Ensure output includes warnings when project scope ignored for trust. |
+| WF-05 | Create crate `codex_pr_workflows` (engine skeleton + schema IO) | P0 | Done | WF-01 | Added `codex-pr-workflows` with schema IO + run-state persistence helpers and unit tests. |
+| WF-06 | Artifact store (content-addressed files + metadata + size limits) | P0 | Done | WF-05, WF-02 | Added filesystem artifact store with sha256 object paths + metadata + artifact/feedback size bounds. |
+| WF-07 | Workflow engine control flow (steps + transitions + bounded revision loop) | P0 | Done | WF-06 | Implemented deterministic transitions for generate/review/revise/complete with terminal `needs_human` on bound overflow. |
+| WF-08 | Action protocol (`WorkflowAction` + results) for headless runner | P0 | Done | WF-07 | Added serde action/result protocol + JSON encode/decode helpers for supervisor mode. |
+| WF-09 | CLI: `codex-pr workflows list/show/draft/restore` | P1 | Done | WF-03, WF-04, WF-05 | CLI now consumes crate schema IO; trust-gated warnings and backups remain in place. |
 | WF-10 | CLI: `codex-pr workflows run` (interactive terminal runner) | P1 | Planned | WF-08, WF-09 | Captures approve/feedback and persists artifacts. |
 | WF-11 | Wire `InvokeAgent` to real model call path in runtime | P2 | Planned | WF-08 | Needs careful boundary: generation must not execute tools. |
 | WF-12 | Add `run_pipeline` step kind (invoke existing pipelines with expanded preview) | P2 | Planned | WF-07 | Optional for v1, required for v1.1 per acceptance criteria. |

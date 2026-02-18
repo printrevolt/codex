@@ -98,6 +98,7 @@ codex-pr workflows list --scope both --json
 codex-pr workflows show --scope both --id product_flow --json
 codex-pr workflows draft --scope global
 codex-pr workflows draft --scope global --apply
+codex-pr workflows restore --scope global --backup-path <path>
 codex-pr workflows enable  --scope global
 codex-pr workflows disable --scope global
 ```
@@ -105,6 +106,11 @@ codex-pr workflows disable --scope global
 Safe defaults:
 - `printrevolt.workflows.enabled=false` by default
 - starter workflow drafts are created with `enabled=false`
+
+Runtime/engine implementation notes:
+- `codex-pr-workflows` provides validated schema IO for `workflows.json`.
+- Workflow runs use a deterministic action protocol (`invoke_agent`, `request_review`, `run_pipeline`, `complete`) that can be serialized for headless supervisors.
+- Workflow artifacts/feedback are stored in a content-addressed artifact store with metadata and bounded sizes.
 
 ## Command Catalogs (`commands.json`)
 

@@ -2144,6 +2144,7 @@ dependencies = [
  "codex-pr-templates",
  "codex-pr-types",
  "codex-pr-updater",
+ "codex-pr-workflows",
  "codex-utils-home-dir",
  "serde",
  "serde_json",
@@ -2282,6 +2283,20 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "codex-pr-workflows"
+version = "0.101.0"
+dependencies = [
+ "chrono",
+ "codex-pr-types",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
  "thiserror 2.0.18",
 ]
 
