@@ -8,20 +8,28 @@ help:
 # `codex`
 alias c := codex
 codex *args:
+    cargo run --release --bin codex -- "$@"
+
+# Debug builds are much larger on disk; keep an explicit entrypoint for when
+# you actually need a debug build.
+codex-debug *args:
     cargo run --bin codex -- "$@"
 
 # `codex exec`
 exec *args:
+    cargo run --release --bin codex -- exec "$@"
+
+exec-debug *args:
     cargo run --bin codex -- exec "$@"
 
 # Run the CLI version of the file-search crate.
 file-search *args:
-    cargo run --bin codex-file-search -- "$@"
+    cargo run --release --bin codex-file-search -- "$@"
 
 # Build the CLI and run the app-server test client
 app-server-test-client *args:
-    cargo build -p codex-cli
-    cargo run -p codex-app-server-test-client -- --codex-bin ./target/debug/codex "$@"
+    cargo build -p codex-cli --release
+    cargo run -p codex-app-server-test-client --release -- --codex-bin ./target/release/codex "$@"
 
 # format code
 fmt:
@@ -62,7 +70,7 @@ build-for-release:
 
 # Run the MCP server
 mcp-server-run *args:
-    cargo run -p codex-mcp-server -- "$@"
+    cargo run -p codex-mcp-server --release -- "$@"
 
 # Regenerate the json schema for config.toml from the current config types.
 write-config-schema:

@@ -367,6 +367,17 @@ strip = "symbols"
 # See https://github.com/openai/codex/issues/1411 for details.
 codegen-units = 1
 
+[profile.dev]
+# Keep local builds from ballooning disk usage:
+# - `incremental` can grow extremely large over time.
+# - `debug = 1` keeps usable symbols/backtraces while reducing artifact size.
+incremental = false
+debug = 1
+
+[profile.test]
+incremental = false
+debug = 1
+
 [profile.ci-test]
 debug = 1         # Reduce debug symbol size
 inherits = "test"
