@@ -44,5 +44,5 @@ pub(crate) struct SessionServices {
     pub(crate) network_proxy: Option<StartedNetworkProxy>,
     pub(crate) state_db: Option<StateDbHandle>,
     /// Session-scoped model client shared across turns.
-    pub(crate) model_client: ModelClient,
+    pub(crate) model_client: RwLock<ModelClient>,
 }

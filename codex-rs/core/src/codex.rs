@@ -1193,7 +1193,7 @@ impl Session {
             agent_control,
             network_proxy,
             state_db: state_db_ctx.clone(),
-            model_client: ModelClient::new(
+            model_client: RwLock::new(ModelClient::new(
                 Some(Arc::clone(&auth_manager)),
                 conversation_id,
                 session_configuration.provider.clone(),
@@ -1205,7 +1205,7 @@ impl Session {
                 config.features.enabled(Feature::EnableRequestCompression),
                 config.features.enabled(Feature::RuntimeMetrics),
                 Self::build_model_client_beta_features_header(config.as_ref()),
-            ),
+            )),
         };
         let js_repl = Arc::new(JsReplHandle::with_node_path(
             config.js_repl_node_path.clone(),
@@ -1222,7 +1222,7 @@ impl Session {
         )
         .boxed();
         let startup_regular_task = RegularTask::with_startup_prewarm(
-            services.model_client.clone(),
+            services.model_client.read().await.clone(),
             services.otel_manager.clone(),
             prewarm_model_info,
             turn_metadata_header,
@@ -1603,6 +1603,97 @@ impl Session {
                 Err(err)
             }
         }
+    }
+
+    pub(crate) async fn switch_model_provider_and_emit(
+        &self,
+        sub_id: String,
+        model_provider_id: String,
+    ) -> anyhow::Result<()> {
+        let (updated_config, updated_provider, session_source, snapshot, thread_name) = {
+            let mut state = self.state.lock().await;
+            let current_config = Arc::clone(&state.session_configuration.original_config_do_not_use);
+            let mut next_config = (*current_config).clone();
+
+            let provider = next_config
+                .model_providers
+                .get(model_provider_id.as_str())
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("Model provider `{model_provider_id}` not found"))?;
+
+            next_config.model_provider_id = model_provider_id.clone();
+            next_config.model_provider = provider.clone();
+            let updated_config = Arc::new(next_config);
+
+            state.session_configuration.provider = provider.clone();
+            state.session_configuration.original_config_do_not_use = Arc::clone(&updated_config);
+
+            let snapshot = state.session_configuration.thread_config_snapshot();
+            let thread_name = state.session_configuration.thread_name.clone();
+            let session_source = state.session_configuration.session_source.clone();
+            (updated_config, provider, session_source, snapshot, thread_name)
+        };
+
+        // Swap the session-scoped model client to match the new provider.
+        let new_model_client = ModelClient::new(
+            Some(Arc::clone(&self.services.auth_manager)),
+            self.conversation_id,
+            updated_provider.clone(),
+            session_source.clone(),
+            updated_config.model_verbosity,
+            updated_config.features.enabled(Feature::ResponsesWebsockets)
+                || updated_config.features.enabled(Feature::ResponsesWebsocketsV2),
+            updated_config.features.enabled(Feature::ResponsesWebsocketsV2),
+            updated_config.features.enabled(Feature::EnableRequestCompression),
+            updated_config.features.enabled(Feature::RuntimeMetrics),
+            Self::build_model_client_beta_features_header(updated_config.as_ref()),
+        );
+        *self.services.model_client.write().await = new_model_client;
+
+        let (history_log_id, history_entry_count) = crate::message_history::history_metadata(
+            updated_config.as_ref(),
+        )
+        .await;
+
+        let rollout_path = self
+            .services
+            .rollout
+            .lock()
+            .await
+            .as_ref()
+            .map(|rec| rec.rollout_path.clone());
+
+        let session_network_proxy = self.services.network_proxy.as_ref().map(|started| {
+            let proxy = started.proxy();
+            SessionNetworkProxyRuntime {
+                http_addr: proxy.http_addr().to_string(),
+                socks_addr: proxy.socks_addr().to_string(),
+                admin_addr: proxy.admin_addr().to_string(),
+            }
+        });
+
+        self.send_event_raw(Event {
+            id: sub_id,
+            msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
+                session_id: self.conversation_id,
+                forked_from_id: None,
+                thread_name,
+                model: snapshot.model,
+                model_provider_id: snapshot.model_provider_id,
+                approval_policy: snapshot.approval_policy,
+                sandbox_policy: snapshot.sandbox_policy,
+                cwd: snapshot.cwd,
+                reasoning_effort: snapshot.reasoning_effort,
+                history_log_id,
+                history_entry_count,
+                initial_messages: None,
+                network_proxy: session_network_proxy,
+                rollout_path,
+            }),
+        })
+        .await;
+
+        Ok(())
     }
 
     pub(crate) async fn new_turn_with_sub_id(
@@ -2983,6 +3074,9 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
                 )
                 .await;
             }
+            Op::SetModelProvider { model_provider_id } => {
+                handlers::set_model_provider(&sess, sub.id.clone(), model_provider_id).await;
+            }
             Op::UserInput { .. } | Op::UserTurn { .. } => {
                 handlers::user_input_or_turn(&sess, sub.id.clone(), sub.op, &mut previous_context)
                     .await;
@@ -3155,6 +3249,22 @@ mod handlers {
         updates: SessionSettingsUpdate,
     ) {
         if let Err(err) = sess.update_settings(updates).await {
+            sess.send_event_raw(Event {
+                id: sub_id,
+                msg: EventMsg::Error(ErrorEvent {
+                    message: err.to_string(),
+                    codex_error_info: Some(CodexErrorInfo::BadRequest),
+                }),
+            })
+            .await;
+        }
+    }
+
+    pub async fn set_model_provider(sess: &Arc<Session>, sub_id: String, model_provider_id: String) {
+        if let Err(err) = sess
+            .switch_model_provider_and_emit(sub_id.clone(), model_provider_id)
+            .await
+        {
             sess.send_event_raw(Event {
                 id: sub_id,
                 msg: EventMsg::Error(ErrorEvent {
@@ -4166,8 +4276,10 @@ pub(crate) async fn run_turn(
     let turn_metadata_header = turn_context.resolve_turn_metadata_header().await;
     // `ModelClientSession` is turn-scoped and caches WebSocket + sticky routing state, so we reuse
     // one instance across retries within this turn.
-    let mut client_session =
-        prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
+    let mut client_session = match prewarmed_client_session {
+        Some(session) => session,
+        None => sess.services.model_client.read().await.new_session(),
+    };
 
     loop {
         // Note that pending_input would be something like a message the user
@@ -4579,12 +4691,13 @@ async fn run_sampling_request(
 
             // In release builds, hide the first websocket retry notification to reduce noisy
             // transient reconnect messages. In debug builds, keep full visibility for diagnosis.
-            let report_error = retries > 1
-                || cfg!(debug_assertions)
-                || !sess
-                    .services
-                    .model_client
-                    .responses_websocket_enabled(&turn_context.model_info);
+            let websocket_enabled = sess
+                .services
+                .model_client
+                .read()
+                .await
+                .responses_websocket_enabled(&turn_context.model_info);
+            let report_error = retries > 1 || cfg!(debug_assertions) || !websocket_enabled;
 
             if report_error {
                 // Surface retry information to any UI/front‑end so the
@@ -6676,7 +6789,7 @@ mod tests {
             agent_control,
             network_proxy: None,
             state_db: None,
-            model_client: ModelClient::new(
+            model_client: RwLock::new(ModelClient::new(
                 Some(auth_manager.clone()),
                 conversation_id,
                 session_configuration.provider.clone(),
@@ -6689,7 +6802,7 @@ mod tests {
                 config.features.enabled(Feature::EnableRequestCompression),
                 config.features.enabled(Feature::RuntimeMetrics),
                 Session::build_model_client_beta_features_header(config.as_ref()),
-            ),
+            )),
         };
         let js_repl = Arc::new(JsReplHandle::with_node_path(
             config.js_repl_node_path.clone(),
@@ -6822,7 +6935,7 @@ mod tests {
             agent_control,
             network_proxy: None,
             state_db: None,
-            model_client: ModelClient::new(
+            model_client: RwLock::new(ModelClient::new(
                 Some(Arc::clone(&auth_manager)),
                 conversation_id,
                 session_configuration.provider.clone(),
@@ -6835,7 +6948,7 @@ mod tests {
                 config.features.enabled(Feature::EnableRequestCompression),
                 config.features.enabled(Feature::RuntimeMetrics),
                 Session::build_model_client_beta_features_header(config.as_ref()),
-            ),
+            )),
         };
         let js_repl = Arc::new(JsReplHandle::with_node_path(
             config.js_repl_node_path.clone(),

@@ -25,6 +25,8 @@ pub enum ConfigEdit {
         model: Option<String>,
         effort: Option<ReasoningEffort>,
     },
+    /// Update the active (or default) model provider id (key into `model_providers`).
+    SetModelProvider { model_provider: Option<String> },
     /// Update the active (or default) model personality.
     SetModelPersonality { personality: Option<Personality> },
     /// Toggle the acknowledgement flag under `[notice]`.
@@ -46,6 +48,9 @@ pub enum ConfigEdit {
     /// Set trust_level under `[projects."<path>"]`,
     /// migrating inline tables to explicit tables.
     SetProjectTrustLevel { path: PathBuf, level: TrustLevel },
+    /// Set model_provider under `[projects."<path>"]`,
+    /// migrating inline tables to explicit tables.
+    SetProjectModelProvider { path: PathBuf, model_provider_id: String },
     /// Set the value stored at the exact dotted path.
     SetPath {
         segments: Vec<String>,
@@ -298,6 +303,10 @@ impl ConfigDocument {
                 );
                 mutated
             }),
+            ConfigEdit::SetModelProvider { model_provider } => Ok(self.write_profile_value(
+                &["model_provider"],
+                model_provider.as_ref().map(|id| value(id.clone())),
+            )),
             ConfigEdit::SetModelPersonality { personality } => Ok(self.write_profile_value(
                 &["personality"],
                 personality.map(|personality| value(personality.to_string())),
@@ -347,6 +356,17 @@ impl ConfigDocument {
                     &mut self.doc,
                     path.as_path(),
                     *level,
+                )?;
+                Ok(true)
+            }
+            ConfigEdit::SetProjectModelProvider {
+                path,
+                model_provider_id,
+            } => {
+                crate::config::set_project_model_provider_inner(
+                    &mut self.doc,
+                    path.as_path(),
+                    model_provider_id.as_str(),
                 )?;
                 Ok(true)
             }
@@ -745,6 +765,13 @@ impl ConfigEditsBuilder {
         self
     }
 
+    pub fn set_model_provider(mut self, model_provider: Option<&str>) -> Self {
+        self.edits.push(ConfigEdit::SetModelProvider {
+            model_provider: model_provider.map(ToOwned::to_owned),
+        });
+        self
+    }
+
     pub fn set_personality(mut self, personality: Option<Personality>) -> Self {
         self.edits
             .push(ConfigEdit::SetModelPersonality { personality });
@@ -806,6 +833,18 @@ impl ConfigEditsBuilder {
         self.edits.push(ConfigEdit::SetProjectTrustLevel {
             path: project_path.into(),
             level: trust_level,
+        });
+        self
+    }
+
+    pub fn set_project_model_provider<P: Into<PathBuf>>(
+        mut self,
+        project_path: P,
+        model_provider_id: &str,
+    ) -> Self {
+        self.edits.push(ConfigEdit::SetProjectModelProvider {
+            path: project_path.into(),
+            model_provider_id: model_provider_id.to_string(),
         });
         self
     }

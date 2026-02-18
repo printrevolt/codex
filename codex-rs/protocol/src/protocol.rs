@@ -195,6 +195,15 @@ pub enum Op {
         personality: Option<Personality>,
     },
 
+    /// Switch the active model provider for this session.
+    ///
+    /// This updates provider-scoped settings (base URL, auth/header policy, wire API)
+    /// and may reset session-scoped transport state (for example WebSocket fallback).
+    SetModelProvider {
+        /// Key into the `model_providers` map (ex: "openai", "gateway", "lmstudio").
+        model_provider_id: String,
+    },
+
     /// Approve a command execution
     ExecApproval {
         /// The id of the submission we are approving

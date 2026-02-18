@@ -835,6 +835,7 @@ mod tests {
                     trust_root.to_string_lossy().to_string(),
                     ProjectConfig {
                         trust_level: Some(TrustLevel::Trusted),
+                        model_provider: None,
                     },
                 )])),
                 ..Default::default()
